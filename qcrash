@@ -1,0 +1,186 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 and
+# only version 2 as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#!/bin/bash
+
+current_dir=$(pwd)
+crash_dir=$(dirname $(which qcrash))
+vmlinux_file=""
+cmm_file=""
+kernel_ver=""
+koffset_str=""
+crashcmd=""
+ddr_info=""
+blank="  "
+platform_info=""
+dump_dir=""
+
+# Usage function
+usage() {
+    echo -e "\n\033[31mCommand Error, Please refer below usage:\033[0m"
+    echo -e "\033[33m    export CRASH_BIN=<crash binary path> \033[0m"
+    echo -e "\033[33m    Usage1: qcrash \033[0m"
+    echo -e "\033[33m        ex. qcrash \033[0m"
+    echo -e "\033[33m    Usage2: qcrash <target vmlinux> <target load.cmm> \033[0m"
+    echo -e "\033[33m        ex. qcrash vmlinux load.cmm or qcrash load.cmm vmlinux\033[0m"
+    echo -e "\033[33mPlease do make sure your vmlinux exist in parent directory(deep level=5) when you are using usage1\033[0m\n"
+    exit
+}
+
+if [[ -z "${CRASH_BIN}" ]]; then
+    echo -e "\033[33m    CRASH_BIN is not set. Please export it before running this script. \033[0m"
+    usage
+fi
+
+# 1. Get the vmlinux path and the load.cmm path
+get_file() {
+    if [ $# -eq 2 ]; then
+        if [[ "$1" =~ "vmlinux" ]]; then
+            vmlinux_file="${current_dir}/$1"
+            cmm_file="${current_dir}/$2"
+        elif [[ "$1" =~ "load.cmm" ]]; then
+            cmm_file="${current_dir}/$1"
+            vmlinux_file="${current_dir}/$2"
+        fi
+    elif [ $# -eq 0 ]; then
+        vmlinux_path="${current_dir}"
+        vmlinux_file="${vmlinux_path}/vmlinux"
+        if [ ! -f "${vmlinux_file}" ]; then
+            for i in {1..5}; do
+                vmlinux_path=${vmlinux_path%/*}
+                vmlinux_file="${vmlinux_path}/vmlinux"
+                [ -f "${vmlinux_file}" ] && break
+            done
+            [ ! -f "${vmlinux_file}" ] && usage
+        fi
+
+        cmm_path="${current_dir}"
+        cmm_file="${cmm_path}/load.cmm"
+        dump_dir="${cmm_path}"
+        if [ ! -f "${cmm_file}" ]; then
+            for i in {1..5}; do
+                cmm_path=${cmm_path%/*}
+                cmm_file="${cmm_path}/load.cmm"
+                if [ -f "${cmm_file}" ]; then
+                    dump_dir="${cmm_path}"
+                    break
+                fi
+            done
+            [ ! -f "${cmm_file}" ] && usage
+        fi
+    fi
+}
+get_file "$@"
+
+# 2. Get kernel version
+get_kernel_version() {
+    kernel_version=$(strings "${vmlinux_file}" | grep "Linux version")
+    kernel_version=${kernel_version%%"SMP PREEMPT"*}
+    kernel_version=${kernel_version##*"Linux version"}
+    kernel_version=${kernel_version%%"("*}
+    kernel_version=${kernel_version:0:7}
+    IFS="." read -r maj min _ <<< "${kernel_version}"
+    kernel_ver="${maj}.${min}"
+}
+get_kernel_version
+
+item_list=(
+    0x08600000      0x086006d0      OCIMEM.BIN
+)
+
+dec2hex() {
+    printf "%x" "$1"
+}
+
+get_koffset() {
+    for (( h=0; h < ${#item_list[@]}/3; h++ )); do
+        istart=${item_list[$((h * 3 + 0))]}
+        kaddr=${item_list[$((h * 3 + 1))]}
+        filename=${item_list[$((h * 3 + 2))]}
+        [[ ! $istart =~ '0x' ]] && continue
+        ((koffset=kaddr-istart))
+        koffset=0x$(dec2hex $koffset)
+        aa=$(od -A x -t x -j $koffset -N 0x10 "${dump_dir}/${filename}")
+        value=${aa:7:8}
+        if [ "$value" = "dead4ead" ]; then
+            koffset_str=" --kaslr=0x${aa:25:8}${aa:16:8}"
+            return
+        fi
+    done
+    koffset_str=" "
+}
+get_koffset
+
+# 4. Get platform
+is_64bit_platform() {
+    cmd_res=$(hexdump -n 1 -s 4 "${vmlinux_file}")
+    tmp=${cmd_res#* }
+    platform=${tmp% *}
+    if [[ ${platform} -eq 1 ]]; then
+        platform_info="32bit"
+    elif [[ ${platform} -eq 2 ]]; then
+        platform_info="64bit"
+    else
+        echo -e "\033[32m    Unknown platform\033[0m"
+        exit
+    fi
+    crashcmd="${CRASH_BIN} -x"
+}
+is_64bit_platform
+
+# 5. Get DDR info
+get_ddr_info() {
+    a=0
+    while read -r line; do
+        for i in $line; do
+            if [ $a -eq 1 ]; then
+                ddr_info="${ddr_info}${i},"
+                a=0
+            fi
+            str1=${i:0:4}
+            if [ "$str1" = "DDRC" ]; then
+                ddr_info="${ddr_info}${dump_dir}/${i}@"
+                a=1
+            fi
+        done
+    done < "${cmm_file}"
+    ddr_info=${ddr_info%,}
+}
+get_ddr_info
+
+# 6. Recursively search for zram.ko and zsmalloc.ko and write to cmd_modules.txt
+cmd_modules_file="${current_dir}/cmd_modules.txt"
+> "$cmd_modules_file"
+
+while IFS= read -r -d '' file; do
+    mod_name=$(basename "$file" .ko)
+    echo "mod -s $mod_name $(realpath "$file")" >> "$cmd_modules_file"
+done < <(find "$current_dir" -type f \( -name "zram.ko" -o -name "zsmalloc.ko" \) -print0)
+
+# 7. Execute crash utility
+qcrash() {
+    crashcmd="${crashcmd}${blank}${vmlinux_file}${blank}${ddr_info}${blank}${koffset_str}"
+    crashcmd="${crashcmd} --machdep vabits_actual=39"
+    if [ -s "$cmd_modules_file" ]; then
+        crashcmd="${crashcmd} -i ${cmd_modules_file}"
+    fi
+}
+qcrash
+
+echo -e "\033[33m    vmlinux: ${vmlinux_file}\033[0m"
+echo -e "\033[33m    load.cmm: ${cmm_file}\033[0m"
+echo -e "\033[33m    Kernel Version: ${kernel_ver}\033[0m"
+echo -e "\033[33m    Platform: ${platform_info}\033[0m"
+echo -e "\033[33m    DUMP: ${dump_dir}\033[0m"
+echo -e "\033[32m    Crashcmd: ${crashcmd}\033[0m"
+
+eval ${crashcmd}

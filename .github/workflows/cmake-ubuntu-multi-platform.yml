@@ -1,0 +1,120 @@
+name: CMake Multi-Platform Build & Release
+ 
+on:
+  push:
+    tags:
+      - 'v*'
+ 
+env:
+  BUILD_TYPE: Debug
+ 
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform: [arm64, x86]
+    runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+ 
+    - name: Get Tag
+      run: |
+        echo "tag=$(git tag)" >> $GITHUB_ENV
+ 
+    - name: Setup Environment (x86)
+      if: matrix.platform == 'x86'
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+ 
+    - name: Install Packages
+      run: |
+        if [[ "${{ matrix.platform }}" == "arm64" ]]; then
+          sudo apt-get install -y gcc g++ cmake liblzo2-dev liblz4-dev libelf-dev libzstd-dev pkg-config libsystemd-dev
+        else
+          sudo apt-get install -y gcc-multilib g++-multilib liblzo2-dev liblzo2-dev:i386 liblz4-dev liblz4-dev:i386 libzstd-dev libzstd-dev:i386 libelf-dev libelf-dev:i386 pkg-config libsystemd-dev libsystemd-dev:i386
+        fi
+ 
+    - name: Build
+      run: |
+        if [[ "${{ matrix.platform }}" == "arm64" ]]; then
+          cmake -DCMAKE_C_COMPILER="gcc"   \
+                -DCMAKE_CXX_COMPILER="g++" \
+                -DCMAKE_BUILD_TYPE="Debug"          \
+                -DCMAKE_BUILD_TARGET_ARCH="arm64"     \
+                -DBUILD_TARGET_TOGETHER="1"         \
+                CMakeLists.txt                      \
+                -B output/arm64
+          make -C output/arm64 -j$(nproc)
+          tar -czvf crash-plugins_${{ env.tag }}_arm64.tar.gz output/arm64/plugins.so
+        else
+          bash build.sh
+          tar -czvf crash-plugins_${{ env.tag }}_x86.tar.gz output/arm64/plugins.so output/arm/plugins.so
+        fi
+ 
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: crash-plugins_${{ env.tag }}_${{ matrix.platform }}.tar.gz
+        path: crash-plugins_${{ env.tag }}_${{ matrix.platform }}.tar.gz
+ 
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: get_tag
+      run: echo "plugin_tag=$(git tag)" >> $GITHUB_ENV
+
+    - name: Download ARM64 Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
+        path: artifacts
+
+    - name: Download x86 Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+        path: artifacts
+    
+    - name: Check the Artifact
+      run: |
+        ls -la artifacts
+        echo "cur_dir=$(pwd)" >> $GITHUB_ENV
+        file artifacts/crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
+        file artifacts/crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+ 
+    - name: Create Release
+      id: create-release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.plugin_tag }}
+        release_name: crash-plugins-${{ env.plugin_tag }}
+        draft: false
+        prerelease: false
+ 
+    - name: Upload ARM64 Artifacts
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ${{ env.cur_dir }}/artifacts/crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
+        asset_name: crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
+        asset_content_type: application/gzip
+ 
+    - name: Upload x86 Artifacts
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ${{ env.cur_dir }}/artifacts/crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+        asset_name: crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+        asset_content_type: application/gzip
