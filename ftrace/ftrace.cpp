@@ -286,15 +286,69 @@ void Ftrace::init_command(void) {
 }
 
 /**
+ * @brief Get pid_max value with fallback for different kernel versions
+ *
+ * https://lore.kernel.org/all/20241122132459.135120-2-aleksandr.mikhalitsyn@canonical.com/
+ * This function attempts to read the pid_max value using multiple methods
+ * to support both old and new kernel versions:
+ * 1. Try reading global pid_max symbol
+ * 2. Try reading init_pid_ns.pid_max
+ * 3. Use architecture-specific default values as fallback
+ *
+ * @return Maximum PID value for the system
+ */
+int Ftrace::get_pid_max_value() {
+    field_init(pid_namespace, pid_max);
+    int pid_max = 0;
+
+    // Method 1: Try old kernel's global pid_max
+    if (csymbol_exists("pid_max")) {
+        LOGD("Attempting to read global pid_max symbol");
+        pid_max = read_int(csymbol_value("pid_max"), "pid_max");
+        if (pid_max > 0) {
+            LOGD("Successfully read pid_max from global symbol: %d", pid_max);
+            return pid_max;
+        }
+    }
+
+    // Method 2: Try new kernel's init_pid_ns.pid_max
+    if (csymbol_exists("init_pid_ns")) {
+        LOGD("Attempting to read init_pid_ns.pid_max");
+        ulong init_pid_ns_addr = csymbol_value("init_pid_ns");
+
+        // Check if pid_namespace.pid_max field is valid
+        if (field_offset(pid_namespace, pid_max) != -1) {
+            pid_max = read_int(init_pid_ns_addr + field_offset(pid_namespace, pid_max),
+                              "init_pid_ns.pid_max");
+            if (pid_max > 0) {
+                LOGD("Successfully read pid_max from init_pid_ns: %d", pid_max);
+                return pid_max;
+            }
+        } else {
+            LOGD("pid_namespace.pid_max field not available in this kernel");
+        }
+    }
+
+    // Method 3: Use default value based on CONFIG_BASE_SMALL
+    std::string config = get_config_val("CONFIG_BASE_SMALL");
+    bool is_base_small = (config == "1");
+    pid_max = is_base_small ? 0x1000 : 0x8000;
+    LOGD("Using default pid_max value: %d (CONFIG_BASE_SMALL: %s)",
+        pid_max, is_base_small ? "yes" : "no");
+
+    return pid_max;
+}
+
+/**
  * @brief Constructor for Ftrace plugin
  *
  * Initializes the Ftrace plugin by reading system configuration values
  * such as maximum PID and number of CPUs.
  */
 Ftrace::Ftrace(){
-    // Read maximum PID value from kernel
-    pid_max = read_int(csymbol_value("pid_max"),"pid_max");
-
+    // Read maximum PID value from kernel with fallback support
+    pid_max = get_pid_max_value();
+    LOGD("Initialized with pid_max: %d", pid_max);
     // Read number of CPUs, default to 1 if not available
     if (!try_get_symbol_data(TO_CONST_STRING("nr_cpu_ids"), sizeof(int), &nr_cpu_ids)) {
         nr_cpu_ids = 1;
