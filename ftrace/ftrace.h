@@ -196,6 +196,7 @@ private:
     void print_trace_array();                                                    /**< Print trace array information */
 
     // Parsing and analysis methods
+    int get_pid_max_value();                                                     /**< Get pid_max value with fallback */
     void parser_savedcmd();                                                      /**< Parse saved command lines */
     void parser_ftrace_trace_arrays();                                          /**< Parse all trace arrays */
     void parse_buffer_page(std::shared_ptr<trace_array> ta_ptr, std::shared_ptr<ring_buffer_per_cpu> rb_ptr, ulong addr); /**< Parse buffer page */
