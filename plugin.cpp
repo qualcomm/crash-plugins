@@ -4869,6 +4869,171 @@ std::string ParserPlugin::to_symbol(ulong addr) {
     return oss.str();
 }
 
+bool ParserPlugin::is_valid_cpu(int cpu) const {
+    if (cpu < 0 || cpu >= NR_CPUS) return false;
+    if (kt != nullptr && kt->cpus > 0 && cpu >= kt->cpus) return false;
+    return true;
+}
+
+std::string ParserPlugin::to_hex_addr(ulong addr) const {
+    std::ostringstream oss;
+    oss << "0x" << std::hex << std::setw(VADDR_PRLEN) << std::setfill('0') << addr;
+    return oss.str();
+}
+
+std::string ParserPlugin::build_box_table(const std::string& title,
+                                          const std::vector<std::string>& headers,
+                                          const std::vector<std::vector<std::string>>& rows,
+                                          const std::vector<bool>& right_align_cols,
+                                          const std::string& footer,
+                                          bool separate_rows) const {
+    if (headers.empty()) {
+        return "";
+    }
+
+    const auto split_lines = [](const std::string& text) -> std::vector<std::string> {
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (true) {
+            const size_t pos = text.find('\n', start);
+            if (pos == std::string::npos) {
+                lines.push_back(text.substr(start));
+                break;
+            }
+            lines.push_back(text.substr(start, pos - start));
+            start = pos + 1;
+        }
+        if (lines.empty()) {
+            lines.push_back("");
+        }
+        return lines;
+    };
+
+    std::vector<size_t> col_widths(headers.size(), 0);
+    for (size_t i = 0; i < headers.size(); ++i) {
+        for (const auto& line : split_lines(headers[i])) {
+            col_widths[i] = std::max(col_widths[i], line.size());
+        }
+    }
+    for (const auto& row : rows) {
+        for (size_t i = 0; i < row.size() && i < col_widths.size(); ++i) {
+            for (const auto& line : split_lines(row[i])) {
+                col_widths[i] = std::max(col_widths[i], line.size());
+            }
+        }
+    }
+
+    size_t inner_width = 0;
+    for (size_t width : col_widths) {
+        inner_width += width + 2;
+    }
+    inner_width += col_widths.size() - 1;
+
+    // ensure title fits within the table width
+    if (!title.empty() && title.size() > inner_width) {
+        col_widths.back() += title.size() - inner_width;
+        inner_width = title.size();
+    }
+
+    const auto make_border = [&](const std::string& left,
+                                 const std::string& mid,
+                                 const std::string& right) -> std::string {
+        std::string line = left;
+        for (size_t i = 0; i < col_widths.size(); ++i) {
+            line += repeat_str("─", col_widths[i] + 2);
+            if (i + 1 < col_widths.size()) {
+                line += mid;
+            }
+        }
+        line += right;
+        return line;
+    };
+    const auto make_full_border = [&](const std::string& left, const std::string& right) -> std::string {
+        return left + repeat_str("─", inner_width) + right;
+    };
+    const auto append_row = [&](std::ostringstream& out, const std::vector<std::string>& cols) {
+        std::vector<std::vector<std::string>> col_lines(col_widths.size());
+        size_t row_height = 1;
+        for (size_t i = 0; i < col_widths.size(); ++i) {
+            const std::string value = (i < cols.size()) ? cols[i] : "";
+            col_lines[i] = split_lines(value);
+            row_height = std::max(row_height, col_lines[i].size());
+        }
+
+        for (size_t line = 0; line < row_height; ++line) {
+            std::string row = "│";
+            for (size_t i = 0; i < col_widths.size(); ++i) {
+                const bool right_align = (i < right_align_cols.size()) ? right_align_cols[i] : false;
+                const std::string value = (line < col_lines[i].size()) ? col_lines[i][line] : "";
+                row += " " + pad_cell(value, col_widths[i], right_align) + " │";
+            }
+            out << row << "\n";
+        }
+    };
+
+    std::ostringstream table;
+    if (!title.empty()) {
+        table << make_full_border("┌", "┐") << "\n";
+        table << "│" << center_text(title, inner_width) << "│\n";
+        table << make_border("├", "┬", "┤") << "\n";
+    } else {
+        table << make_border("┌", "┬", "┐") << "\n";
+    }
+    append_row(table, headers);
+    table << make_border("├", "┼", "┤") << "\n";
+    for (size_t i = 0; i < rows.size(); ++i) {
+        append_row(table, rows[i]);
+        if (separate_rows && i + 1 < rows.size()) {
+            table << make_border("├", "┼", "┤") << "\n";
+        }
+    }
+    if (!footer.empty()) {
+        table << make_border("├", "┴", "┤") << "\n";
+        table << "│" << pad_cell(footer, inner_width, false) << "│\n";
+        table << make_full_border("└", "┘");
+    } else {
+        table << make_border("└", "┴", "┘");
+    }
+    return table.str();
+}
+
+std::string ParserPlugin::repeat_str(const std::string& token, size_t n) const {
+    std::string out;
+    out.reserve(token.size() * n);
+    for (size_t i = 0; i < n; ++i) {
+        out += token;
+    }
+    return out;
+}
+
+std::string ParserPlugin::pad_cell(const std::string& value, size_t width, bool right_align) const {
+    if (value.size() >= width) {
+        return value;
+    }
+    const std::string padding(width - value.size(), ' ');
+    return right_align ? (padding + value) : (value + padding);
+}
+
+std::string ParserPlugin::center_text(const std::string& value, size_t width) const {
+    if (value.size() >= width) {
+        return value;
+    }
+    const size_t left = (width - value.size()) / 2;
+    const size_t right = width - value.size() - left;
+    return std::string(left, ' ') + value + std::string(right, ' ');
+}
+
+std::string ParserPlugin::task_state_display(ulong task) const {
+    char buf[BUFSIZE];
+    task_state_string(task, buf, 0);
+    if (strcmp(buf, "??") == 0) {
+        char hex[32];
+        snprintf(hex, sizeof(hex), "0x%lx", task_state(task));
+        return hex;
+    }
+    return buf;
+}
+
 /**
  * Convert jiffies to milliseconds
  *

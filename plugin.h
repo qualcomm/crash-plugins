@@ -206,6 +206,8 @@ protected:
     static constexpr double KB = 1024.0;
     static constexpr double MB = 1024.0 * 1024.0;
     static constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+    bool is_valid_cpu(int cpu) const;
+    std::string task_state_display(ulong task) const;
     std::unordered_map<std::string, std::unique_ptr<Typeinfo>> typetable;
 
 public:
@@ -354,6 +356,16 @@ public:
 
     // Page owner related functions
     bool is_enable_pageowner();
+    std::string repeat_str(const std::string& token, size_t n) const;
+    std::string pad_cell(const std::string& value, size_t width, bool right_align) const;
+    std::string center_text(const std::string& value, size_t width) const;
+    std::string build_box_table(const std::string& title,
+                                const std::vector<std::string>& headers,
+                                const std::vector<std::vector<std::string>>& rows,
+                                const std::vector<bool>& right_align_cols,
+                                const std::string& footer = std::string(),
+                                bool separate_rows = false) const;
+    std::string to_hex_addr(ulong addr) const;
     std::shared_ptr<page_owner> parse_page_owner_by_page(ulong page_addr);
     std::shared_ptr<page_owner> parse_page_owner_by_pfn(ulong pfn);
     std::shared_ptr<page_owner> parse_page_owner_by_phys(ulong phys_addr);
