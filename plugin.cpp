@@ -2081,6 +2081,23 @@ std::vector<ulong> ParserPlugin::for_each_percpu(ulong addr) {
     return cpu_list;
 }
 
+std::vector<ulong> ParserPlugin::for_each_waiter(ulong wait_queue_head_addr) {
+    std::vector<ulong> waiter_list;
+
+    // Validate the wait_queue_head address
+    if (!is_kvaddr(wait_queue_head_addr)) {
+        return waiter_list;
+    }
+
+    // Get the address of wait_queue_head.head (the embedded list_head)
+    ulong list_head_addr = wait_queue_head_addr + field_offset(wait_queue_head, head);
+
+    // Use for_each_list to traverse the wait queue
+    waiter_list = for_each_list(list_head_addr, field_offset(wait_queue_entry, entry));
+
+    return waiter_list;
+}
+
 /**
  * Parse device class information from kernel memory
  *
