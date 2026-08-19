@@ -130,7 +130,9 @@ list(APPEND PLUGIN_SOURCES
     systemd/journal.cpp
     iommu/iommu.cpp
     t32/t32.cpp
-    lockdep/lockdep.cpp)
+    lockdep/lockdep.cpp
+    timer/timer.cpp
+    )
 
 add_library(plugins SHARED ${PLUGIN_SOURCES})
 if (CMAKE_BUILD_TARGET_ARCH STREQUAL "arm64")

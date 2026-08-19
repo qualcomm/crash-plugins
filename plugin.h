@@ -267,6 +267,7 @@ public:
     std::vector<ulong> for_each_misc_dev();
     std::vector<ulong> for_each_bdev();
     std::vector<ulong> for_each_bus();
+    std::vector<ulong> for_each_waiter(ulong wait_queue_head_addr);
 
     std::vector<std::shared_ptr<bus_type>> for_each_bus_type();
     std::vector<std::shared_ptr<class_type>> for_each_class_type();
