@@ -1168,8 +1168,6 @@ std::vector<ulong> Lockdep::find_held_locks_pi_waiters(ulong task_addr) {
  * -------------------------------------------------------------------------
  */
 std::string Lockdep::try_name_percpu_lock(ulong lock_addr) {
-    if (!csymbol_exists("__per_cpu_offset")) return "";
-
     /* candidate per-CPU lock symbols to probe */
     static const char *candidates[] = {
         "softirq_ctrl",   /* PREEMPT_RT BH lock */
@@ -1177,24 +1175,20 @@ std::string Lockdep::try_name_percpu_lock(ulong lock_addr) {
         nullptr
     };
 
-    ulong pcpu_off_arr = csymbol_value("__per_cpu_offset");
-
     for (int i = 0; candidates[i]; i++) {
         if (!csymbol_exists(candidates[i])) continue;
         ulong base = csymbol_value(candidates[i]);
+        std::vector<ulong> percpu_addrs = for_each_percpu(base);
 
-        for (int cpu = 0; cpu < 64; cpu++) {     /* scan up to 64 CPUs */
-            ulong cpu_off = read_ulong(
-                pcpu_off_arr + (ulong)cpu * sizeof(ulong), "pcpu_off");
-            if (!cpu_off) break;                  /* past last CPU */
-
-            ulong candidate_addr = base + cpu_off;
+        for (size_t cpu = 0; cpu < percpu_addrs.size(); cpu++) {
+            ulong candidate_addr = percpu_addrs[cpu];
+            if (!candidate_addr) continue;
             /* check a small range around the per-CPU base in case the
              * rt_mutex_base is at a small offset within the structure */
             if (lock_addr >= candidate_addr &&
                 lock_addr <  candidate_addr + 512) {
                 char buf[64];
-                snprintf(buf, sizeof(buf), "%s (CPU %d)", candidates[i], cpu);
+                snprintf(buf, sizeof(buf), "%s (CPU %zu)", candidates[i], cpu);
                 return buf;
             }
         }
@@ -1221,14 +1215,15 @@ std::vector<ulong> Lockdep::find_held_locks_all(
     std::unordered_set<ulong> seen;
 
     auto add = [&](ulong la, const std::string &src) {
-        if (!la || !is_kvaddr(la) || !seen.insert(la).second) return;
-        result.push_back(la);
-        /* name: try symbol, then per-CPU identification */
-        std::string sym = to_symbol(la);
-        bool has_sym = !sym.empty() && sym[0] != '[';
-        if (!has_sym) sym = try_name_percpu_lock(la);
-        names.push_back(sym.empty() ? "?" : sym);
-        sources.push_back(src);
+        if (la && is_kvaddr(la) && seen.insert(la).second) {
+            result.push_back(la);
+            /* name: try symbol, then per-CPU identification */
+            std::string sym = to_symbol(la);
+            bool has_sym = !sym.empty() && sym[0] != '[';
+            if (!has_sym) sym = try_name_percpu_lock(la);
+            names.push_back(sym.empty() ? "?" : sym);
+            sources.push_back(src);
+        }
     };
 
     /* Source 1: pi_waiters (most reliable for PREEMPT_RT, finds locks with waiters) */

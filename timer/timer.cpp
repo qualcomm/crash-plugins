@@ -30,8 +30,19 @@ TimerParser::TimerParser() {
 
     std::string hz_cfg = get_config_val("CONFIG_HZ");
     if (!hz_cfg.empty() && hz_cfg != "n") {
-        if (hz <= 0.0) {
-            hz = 100.0;
+        try {
+            if (!std::all_of(hz_cfg.begin(), hz_cfg.end(), [](char ch) {
+                    return ch >= '0' && ch <= '9';
+                })) {
+                throw std::invalid_argument("invalid CONFIG_HZ");
+            }
+            size_t pos = 0;
+            unsigned long parsed_hz = std::stoul(hz_cfg, &pos);
+            if (pos == hz_cfg.size() && parsed_hz > 0) {
+                hz = static_cast<double>(parsed_hz);
+            }
+        } catch (const std::exception&) {
+            // Keep the default HZ when the configuration cannot be parsed.
         }
     }
 
@@ -212,8 +223,18 @@ void TimerParser::cmd_main(void) {
                 show_hrtimer = true;
                 break;
             case 'c': {
-                int val = atoi(optarg);
-                if (!is_valid_cpu(val)) {
+                int val = 0;
+                bool valid = true;
+                try {
+                    size_t pos = 0;
+                    val = std::stoi(optarg, &pos);
+                    if (pos != std::string(optarg).size()) {
+                        valid = false;
+                    }
+                } catch (const std::exception&) {
+                    valid = false;
+                }
+                if (!valid || !is_valid_cpu(val)) {
                     PRINT("timerlist: invalid cpu: %s\n", optarg);
                     argerrs++;
                 } else {
@@ -224,7 +245,20 @@ void TimerParser::cmd_main(void) {
                 break;
             }
             case 't':
-                convert_jiffies = true;
+                try {
+                    size_t pos = 0;
+                    if (optarg[0] == '-') {
+                        throw std::invalid_argument("negative jiffies");
+                    }
+                    jiffies_val = std::stoull(optarg, &pos);
+                    if (pos != std::string(optarg).size()) {
+                        throw std::invalid_argument("trailing characters");
+                    }
+                    convert_jiffies = true;
+                } catch (const std::exception&) {
+                    PRINT("timerlist: invalid jiffies value: %s\n", optarg);
+                    argerrs++;
+                }
                 break;
             default:
                 argerrs++;
