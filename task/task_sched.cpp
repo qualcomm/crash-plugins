@@ -64,6 +64,21 @@ void TaskSched::cmd_main(void) {
     opterr = 0;
     optarg = nullptr;
 
+    auto parse_cpu = [](const std::string& value, int& parsed) {
+        if (value.empty() || !std::all_of(value.begin(), value.end(), [](char ch) {
+                return ch >= '0' && ch <= '9';
+            })) {
+            return false;
+        }
+        try {
+            size_t pos = 0;
+            parsed = std::stoi(value, &pos);
+            return pos == value.size();
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+
     while ((c = getopt(argcnt, args, "Tc:")) != EOF) {
         switch(c) {
             case 'T':
@@ -72,7 +87,7 @@ void TaskSched::cmd_main(void) {
             case 'c':
             {
                 cppString.assign(optarg);
-                if (!is_valid_cpu(cpu)) {
+                if (!parse_cpu(cppString, cpu) || !is_valid_cpu(cpu)) {
                     PRINT("invalid value: %s\n", cppString.c_str());
                     argerrs++;
                     continue;
@@ -98,7 +113,7 @@ void TaskSched::cmd_main(void) {
 
     if (throttle_mode && !has_cpu && optind < argcnt) {
         cppString.assign(args[optind]);
-        if (!is_valid_cpu(cpu)) {
+        if (!parse_cpu(cppString, cpu) || !is_valid_cpu(cpu)) {
             PRINT("invalid cpu value: %s\n", cppString.c_str());
             cmd_usage(pc->curcmd, SYNOPSIS);
             return;
