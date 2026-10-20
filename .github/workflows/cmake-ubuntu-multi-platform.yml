@@ -7,6 +7,7 @@ on:
  
 env:
   BUILD_TYPE: Debug
+  RELEASE_TAG: ${{ github.ref_name }}
  
 jobs:
   build:
@@ -14,13 +15,11 @@ jobs:
       matrix:
         platform: [arm64, x86]
     runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    env:
+      PLATFORM: ${{ matrix.platform }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
- 
-    - name: Get Tag
-      run: |
-        echo "tag=$(git tag)" >> $GITHUB_ENV
  
     - name: Setup Environment (x86)
       if: matrix.platform == 'x86'
@@ -30,7 +29,7 @@ jobs:
  
     - name: Install Packages
       run: |
-        if [[ "${{ matrix.platform }}" == "arm64" ]]; then
+        if [[ "$PLATFORM" == "arm64" ]]; then
           sudo apt-get install -y gcc g++ cmake liblzo2-dev liblz4-dev libelf-dev libzstd-dev pkg-config libsystemd-dev
         else
           sudo apt-get install -y gcc-multilib g++-multilib liblzo2-dev liblzo2-dev:i386 liblz4-dev liblz4-dev:i386 libzstd-dev libzstd-dev:i386 libelf-dev libelf-dev:i386 pkg-config libsystemd-dev libsystemd-dev:i386
@@ -38,7 +37,7 @@ jobs:
  
     - name: Build
       run: |
-        if [[ "${{ matrix.platform }}" == "arm64" ]]; then
+        if [[ "$PLATFORM" == "arm64" ]]; then
           cmake -DCMAKE_C_COMPILER="gcc"   \
                 -DCMAKE_CXX_COMPILER="g++" \
                 -DCMAKE_BUILD_TYPE="Debug"          \
@@ -47,17 +46,17 @@ jobs:
                 CMakeLists.txt                      \
                 -B output/arm64
           make -C output/arm64 -j$(nproc)
-          tar -czvf crash-plugins_${{ env.tag }}_arm64.tar.gz output/arm64/plugins.so
+          tar -czvf "crash-plugins_${RELEASE_TAG}_arm64.tar.gz" output/arm64/plugins.so
         else
           bash build.sh
-          tar -czvf crash-plugins_${{ env.tag }}_x86.tar.gz output/arm64/plugins.so output/arm/plugins.so
+          tar -czvf "crash-plugins_${RELEASE_TAG}_x86.tar.gz" output/arm64/plugins.so output/arm/plugins.so
         fi
  
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: crash-plugins_${{ env.tag }}_${{ matrix.platform }}.tar.gz
-        path: crash-plugins_${{ env.tag }}_${{ matrix.platform }}.tar.gz
+        name: crash-plugins_${{ env.RELEASE_TAG }}_${{ matrix.platform }}.tar.gz
+        path: crash-plugins_${{ env.RELEASE_TAG }}_${{ matrix.platform }}.tar.gz
  
   release:
     needs: build
@@ -66,27 +65,23 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: get_tag
-      run: echo "plugin_tag=$(git tag)" >> $GITHUB_ENV
-
     - name: Download ARM64 Artifacts
       uses: actions/download-artifact@v4
       with:
-        name: crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
+        name: crash-plugins_${{ env.RELEASE_TAG }}_arm64.tar.gz
         path: artifacts
 
     - name: Download x86 Artifact
       uses: actions/download-artifact@v4
       with:
-        name: crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+        name: crash-plugins_${{ env.RELEASE_TAG }}_x86.tar.gz
         path: artifacts
     
     - name: Check the Artifact
       run: |
         ls -la artifacts
-        echo "cur_dir=$(pwd)" >> $GITHUB_ENV
-        file artifacts/crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
-        file artifacts/crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+        file "artifacts/crash-plugins_${RELEASE_TAG}_arm64.tar.gz"
+        file "artifacts/crash-plugins_${RELEASE_TAG}_x86.tar.gz"
  
     - name: Create Release
       id: create-release
@@ -94,8 +89,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ env.plugin_tag }}
-        release_name: crash-plugins-${{ env.plugin_tag }}
+        tag_name: ${{ env.RELEASE_TAG }}
+        release_name: crash-plugins-${{ env.RELEASE_TAG }}
         draft: false
         prerelease: false
  
@@ -105,8 +100,8 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create-release.outputs.upload_url }}
-        asset_path: ${{ env.cur_dir }}/artifacts/crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
-        asset_name: crash-plugins_${{ env.plugin_tag }}_arm64.tar.gz
+        asset_path: ${{ github.workspace }}/artifacts/crash-plugins_${{ env.RELEASE_TAG }}_arm64.tar.gz
+        asset_name: crash-plugins_${{ env.RELEASE_TAG }}_arm64.tar.gz
         asset_content_type: application/gzip
  
     - name: Upload x86 Artifacts
@@ -115,6 +110,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create-release.outputs.upload_url }}
-        asset_path: ${{ env.cur_dir }}/artifacts/crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
-        asset_name: crash-plugins_${{ env.plugin_tag }}_x86.tar.gz
+        asset_path: ${{ github.workspace }}/artifacts/crash-plugins_${{ env.RELEASE_TAG }}_x86.tar.gz
+        asset_name: crash-plugins_${{ env.RELEASE_TAG }}_x86.tar.gz
         asset_content_type: application/gzip
