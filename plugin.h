@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <memory>
 #include <functional>
+#include <type_traits>
 #include <algorithm>
 #include <bitset>
 #include <set>
@@ -74,6 +75,17 @@ struct class_type {
     size_t addr;
     std::string name;
     size_t subsys_private;
+};
+
+struct TreeEntry {
+    ulong index;
+    ulong value;
+};
+
+struct StackFrame {
+    ulong fp;
+    ulong pc;
+    std::string sym;
 };
 
 #define field_init(type,field_name,...) type_init(TO_STD_STRING(type),TO_STD_STRING(field_name), ##__VA_ARGS__)
@@ -205,6 +217,45 @@ private:
     std::string pad_cell(const std::string& value, size_t width, bool right_align) const;
     std::string center_text(const std::string& value, size_t width) const;
 
+    /**
+     * Internal template: shared implementation for all tree traversal functions.
+     *
+     * Two-pass pattern: COUNT to get entry count, then GATHER into a buffer,
+     * then iterate and apply the output_policy lambda to build the result.
+     *
+     * @param root_addr       Address of the tree root
+     * @param count_fn        Function for COUNT operation (returns entry count)
+     * @param gather_fn       Function for GATHER operation (fills buffer)
+     * @param output_policy   Lambda(list_pair&) -> T, transforms entries to output type
+     * @return Result vector built by applying output_policy to valid entries
+     */
+    template<typename CountFn, typename GatherFn, typename OutputPolicy>
+    auto for_each_tree_impl(ulong root_addr, CountFn count_fn, GatherFn gather_fn,
+                            OutputPolicy output_policy) -> std::vector<decltype(output_policy(std::declval<const struct list_pair&>()))> {
+        using T = decltype(output_policy(std::declval<const struct list_pair&>()));
+        std::vector<T> res;
+        if (!is_kvaddr(root_addr)) {
+            return res;
+        }
+        size_t count = count_fn(root_addr, 0, NULL);
+        if (count == 0 || count > (SIZE_MAX / sizeof(struct list_pair) - 1)) {
+            return res;
+        }
+        struct list_pair *entry_list = (struct list_pair *)GETBUF((count + 1) * sizeof(struct list_pair));
+        entry_list[0].index = count;
+        ulong gathered = gather_fn(root_addr, 0, entry_list);
+        size_t n = std::min((size_t)gathered, count);
+        res.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            ulong addr = (ulong)entry_list[i].value;
+            if (is_kvaddr(addr)) {
+                res.push_back(output_policy(entry_list[i]));
+            }
+        }
+        FREEBUF(entry_list);
+        return res;
+    }
+
 protected:
     static constexpr double KB = 1024.0;
     static constexpr double MB = 1024.0 * 1024.0;
@@ -262,6 +313,9 @@ public:
     std::vector<ulong> for_each_xarray(ulong xarray_addr);
     std::vector<ulong> for_each_mptree(ulong maptree_addr);
     std::vector<ulong> for_each_radix(ulong root_rnode);
+    std::vector<TreeEntry> for_each_xarray_with_index(ulong xarray_addr);
+    std::vector<TreeEntry> for_each_mptree_with_index(ulong maptree_addr);
+    std::vector<TreeEntry> for_each_radix_with_index(ulong root_rnode);
 
     std::vector<ulong> for_each_pfn();
     std::vector<ulong> for_each_file_page();
@@ -347,6 +401,24 @@ public:
     bool load_symbols(std::string& path, std::string name);
     void uwind_irq_back_trace(int cpu, ulong x30);
     void uwind_task_back_trace(int pid, ulong x30);
+    /**
+     * Unwind task stack frames into a structured list of StackFrame entries
+     *
+     * Extracts frame pointer (fp), program counter (pc), and symbol for each
+     * frame in the task's call stack. Uses a three-tier fallback strategy for
+     * reading initial context registers: offset_table resolved flat offsets,
+     * computed nested field offsets, and hardcoded ARM64/ARM32 fallback offsets.
+     *
+     * On ARM64, walks the frame pointer chain until reaching max_depth, detecting
+     * cycles and corrupted chains. On ARM32, captures only the initial PC from
+     * the saved context (ARM32 frame pointer ABI is not standardized enough
+     * to reliably walk the chain).
+     *
+     * @param tc The task context to unwind (nullptr-safe)
+     * @param max_depth Maximum number of frames to traverse (default 40)
+     * @return Vector of StackFrame entries, empty if tc is invalid or PC is zero
+     */
+    std::vector<StackFrame> unwind_task_frames(struct task_context *tc, int max_depth = 40);
     std::shared_ptr<stack_record_t> get_stack_record(uint handle);
     std::string get_call_stack(std::shared_ptr<stack_record_t> record_ptr);
     std::vector<std::shared_ptr<mount_point>> get_mntpoint_list(task_context *tc);

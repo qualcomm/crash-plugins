@@ -14,6 +14,10 @@
  */
 
 #include "binder.h"
+#include <algorithm>
+#include <functional>
+#include <unordered_set>
+#include <cstring>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpointer-arith"
@@ -38,7 +42,7 @@ void Binder::cmd_main(void) {
     BZERO(&binder_arg, sizeof(binder_arg));
     // Parse command line options
     int c;
-    while ((c = getopt(argcnt, args, "tnrbflap:")) != EOF) {
+    while ((c = getopt(argcnt, args, "tnrbflap:ocdBsq")) != EOF) {
         switch(c) {
             case 'a':
                 // Dump all binder processes with full information
@@ -91,6 +95,36 @@ void Binder::cmd_main(void) {
                 binder_arg.dump_all = 1;
                 binder_arg.flags = BINDER_ALLOC;
                 binder_proc_show(&binder_arg);
+                return;
+            case 'o':
+                // Dump diagnostic overview
+                collect_diag_data();
+                print_diag_overview();
+                return;
+            case 'c':
+                // Display synchronous call chains
+                collect_diag_data();
+                print_diag_call_chains();
+                return;
+            case 'd':
+                // Detect thread-level dependency cycles (potential deadlocks)
+                collect_diag_data();
+                print_diag_dependency_cycles();
+                return;
+            case 'B':
+                // Rank top blocker processes
+                collect_diag_data();
+                print_diag_top_blockers();
+                return;
+            case 's':
+                // Diagnose thread pool starvation
+                collect_diag_data();
+                print_diag_thread_starvation();
+                return;
+            case 'q':
+                // Analyze pending todo and async oneway queues
+                collect_diag_data();
+                print_diag_queue_and_oneway();
                 return;
             default:
                 LOGE("Invalid option '%c'\n", c);
@@ -228,8 +262,8 @@ void Binder::init_command(void) {
     cmd_name = "binder";
     help_str_list={
         "binder",                            /* command name */
-        "dump binder log information",        /* short description */
-        "[-a] [-p pid] [-l] [-f] [-n] [-b] [-t] [-r]\n"
+        "dump binder information and IPC diagnostics",        /* short description */
+        "[-a] [-p pid] [-l] [-f] [-n] [-b] [-t] [-r] [-o] [-c] [-d] [-B] [-s] [-q]\n"
             "\n"
             "  -a         display all binder proc states\n"
             "  -p pid     display specific process binder states\n"
@@ -238,7 +272,13 @@ void Binder::init_command(void) {
             "  -n         display binder node info\n"
             "  -b         display binder buffer info\n"
             "  -t         display binder thread info\n"
-            "  -r         display binder ref info\n",
+            "  -r         display binder ref info\n"
+            "  -o         display diagnostic overview and health assessment\n"
+            "  -c         display synchronous call chains (A -> B -> C)\n"
+            "  -d         detect thread-level dependency cycles (potential deadlocks)\n"
+            "  -B         rank top blocker processes causing downstream waits\n"
+            "  -s         diagnose binder thread pool starvation\n"
+            "  -q         analyze pending todo and async oneway queues\n",
         "\n",
         "EXAMPLES",
         "  Display all binder proc states:",
@@ -252,6 +292,24 @@ void Binder::init_command(void) {
         "       proc 7312",
         "       context hwbinder",
         "           thread 7335: l 00 need_return 0 tr 0",
+        "\n",
+        "  Display system-wide IPC diagnostic overview:",
+        "    %s> binder -o",
+        "\n",
+        "  Display synchronous transaction call chains:",
+        "    %s> binder -c",
+        "\n",
+        "  Detect dependency cycles in transactions:",
+        "    %s> binder -d",
+        "\n",
+        "  Rank top blocker processes:",
+        "    %s> binder -B",
+        "\n",
+        "  Diagnose thread pool starvation:",
+        "    %s> binder -s",
+        "\n",
+        "  Analyze pending todo and async queues:",
+        "    %s> binder -q",
         "\n",
         "  Display binder transaction log:",
         "    %s> binder -l",
@@ -1027,5 +1085,800 @@ void Binder::print_binder_work_ilocked(ulong proc_addr, const char* prefix, cons
             PRINT("%sunknown work: type %d\n", prefix, w.type);
             break;
     }
+}
+
+void Binder::get_thread_state_and_wchan(int tid, std::string &state_str, std::string &wchan) {
+    state_str = "[unknown]";
+    wchan = "";
+    struct task_context *tc = pid_to_context(tid);
+    if (!tc || !tc->task) return;
+
+    char sbuf[32];
+    task_state_string(tc->task, sbuf, 0);
+    state_str = sbuf;
+
+    std::vector<StackFrame> frames = unwind_task_frames(tc, 20);
+    static const std::unordered_set<std::string> primitives = {
+        "__switch_to", "cpu_switch_to", "context_switch",
+        "__schedule", "schedule", "schedule_timeout",
+        "schedule_timeout_interruptible", "schedule_timeout_uninterruptible",
+        "schedule_preempt_disabled"
+    };
+
+    for (const auto &frame : frames) {
+        if (!frame.sym.empty()) {
+            size_t pos = frame.sym.find('+');
+            std::string fn = (pos != std::string::npos) ? frame.sym.substr(0, pos) : frame.sym;
+            if (primitives.find(fn) == primitives.end()) {
+                wchan = frame.sym;
+                break;
+            }
+        }
+    }
+    // Only use first frame if it is not a scheduling primitive
+    // (all-primitive chains are normal kernel scheduling, not actual waits)
+}
+
+void Binder::collect_diag_threads(std::shared_ptr<BinderDiagProc> proc, ulong threads_rb_node, ulong wait_threads_next) {
+    std::vector<ulong> thread_list = for_each_rbtree(threads_rb_node, field_offset(binder_thread, rb_node));
+    std::vector<ulong> wait_thread_list = for_each_list(wait_threads_next, field_offset(binder_thread, waiting_thread_node));
+
+    proc->total_threads = thread_list.size();
+    proc->ready_threads = wait_thread_list.size();
+    proc->thread_addrs = thread_list;
+
+    for (const auto &thread_addr : thread_list) {
+        if (!is_kvaddr(thread_addr)) continue;
+
+        void *thread_buf = read_struct(thread_addr, "binder_thread");
+        if (!thread_buf) continue;
+
+        auto t = std::make_shared<BinderDiagThread>();
+        t->thread_addr = thread_addr;
+        t->pid = INT(thread_buf + field_offset(binder_thread, pid));
+        t->proc_pid = proc->pid;
+        t->proc_name = proc->comm;
+        t->looper = INT(thread_buf + field_offset(binder_thread, looper));
+        t->is_dead = BOOL(thread_buf + field_offset(binder_thread, is_dead));
+        t->transaction_stack = ULONG(thread_buf + field_offset(binder_thread, transaction_stack));
+        FREEBUF(thread_buf);
+
+        if (t->pid <= 0) continue;
+
+        struct task_context *tc = pid_to_context(t->pid);
+        if (tc) t->comm = tc->comm;
+        else t->comm = proc->comm;
+
+        get_thread_state_and_wchan(t->pid, t->state_str, t->wchan);
+
+        proc->threads.push_back(t);
+        diag_threads_by_addr[t->thread_addr] = t;
+        diag_threads_by_tid[t->pid] = t;
+    }
+}
+
+void Binder::collect_diag_todo(std::shared_ptr<BinderDiagProc> proc, ulong list_head_todo) {
+    const int work_offset = field_offset(binder_work, entry);
+    std::vector<ulong> work_list = for_each_list(list_head_todo, work_offset);
+    proc->todo_count = work_list.size();
+
+    for (const auto &work_addr : work_list) {
+        struct binder_work w;
+        if (!read_struct(work_addr, &w, sizeof(w), "binder_work")) continue;
+
+        if (w.type == BINDER_WORK_TRANSACTION) {
+            const ulong trans_addr = work_addr - field_offset(binder_transaction, work);
+            if (!is_kvaddr(trans_addr)) continue;
+
+            void *trans_buf = read_struct(trans_addr, "binder_transaction");
+            if (!trans_buf) continue;
+
+            auto trans = std::make_shared<BinderDiagTransaction>();
+            trans->trans_addr = trans_addr;
+            trans->is_pending_in_todo = true;
+            trans->debug_id = UINT(trans_buf + field_offset(binder_transaction, debug_id));
+            trans->code = UINT(trans_buf + field_offset(binder_transaction, code));
+            trans->flags = UINT(trans_buf + field_offset(binder_transaction, flags));
+            trans->need_reply = UINT(trans_buf + field_offset(binder_transaction, need_reply));
+            trans->is_oneway = (trans->flags & TF_ONE_WAY) != 0;
+            trans->from_thread_addr = ULONG(trans_buf + field_offset(binder_transaction, from));
+            trans->to_proc_addr = ULONG(trans_buf + field_offset(binder_transaction, to_proc));
+            trans->to_thread_addr = ULONG(trans_buf + field_offset(binder_transaction, to_thread));
+            trans->buffer_addr = ULONG(trans_buf + field_offset(binder_transaction, buffer));
+            FREEBUF(trans_buf);
+
+            trans->to_pid = proc->pid;
+            trans->to_proc_name = proc->comm;
+
+            if (is_kvaddr(trans->from_thread_addr)) {
+                auto from_t_it = diag_threads_by_addr.find(trans->from_thread_addr);
+                if (from_t_it != diag_threads_by_addr.end()) {
+                    auto from_t = from_t_it->second;
+                    trans->from_tid = from_t->pid;
+                    trans->from_pid = from_t->proc_pid;
+                    trans->from_proc_name = from_t->proc_name;
+                    trans->from_thread_name = from_t->comm;
+                }
+            }
+
+            proc->todos.push_back(trans);
+            if (trans->need_reply) {
+                diag_active_transactions.push_back(trans);
+            }
+        }
+    }
+}
+
+void Binder::collect_diag_thread_transactions(std::shared_ptr<BinderDiagThread> thread) {
+    ulong t = thread->transaction_stack;
+    std::set<ulong> visited;
+
+    while (t && is_kvaddr(t)) {
+        if (visited.find(t) != visited.end()) {
+            break;
+        }
+        visited.insert(t);
+
+        void *trans_buf = read_struct(t, "binder_transaction");
+        if (!trans_buf) break;
+
+        ulong t_from = ULONG(trans_buf + field_offset(binder_transaction, from));
+        ulong t_from_parent = ULONG(trans_buf + field_offset(binder_transaction, from_parent));
+        ulong t_to_parent = ULONG(trans_buf + field_offset(binder_transaction, to_parent));
+        ulong t_to_thread = ULONG(trans_buf + field_offset(binder_transaction, to_thread));
+        ulong t_to_proc = ULONG(trans_buf + field_offset(binder_transaction, to_proc));
+        ulong t_buffer = ULONG(trans_buf + field_offset(binder_transaction, buffer));
+        unsigned int debug_id = UINT(trans_buf + field_offset(binder_transaction, debug_id));
+        unsigned int code = UINT(trans_buf + field_offset(binder_transaction, code));
+        unsigned int flags = UINT(trans_buf + field_offset(binder_transaction, flags));
+        unsigned int need_reply = UINT(trans_buf + field_offset(binder_transaction, need_reply));
+        FREEBUF(trans_buf);
+
+        if (t_from == thread->thread_addr) {
+            // Outgoing transaction from this thread
+            if (need_reply) {
+                thread->is_waiting = true;
+                auto trans = std::make_shared<BinderDiagTransaction>();
+                trans->trans_addr = t;
+                trans->debug_id = debug_id;
+                trans->code = code;
+                trans->flags = flags;
+                trans->need_reply = true;
+                trans->is_oneway = (flags & TF_ONE_WAY) != 0;
+                trans->from_thread_addr = thread->thread_addr;
+                trans->from_tid = thread->pid;
+                trans->from_pid = thread->proc_pid;
+                trans->from_proc_name = thread->proc_name;
+                trans->from_thread_name = thread->comm;
+                trans->to_proc_addr = t_to_proc;
+                trans->to_thread_addr = t_to_thread;
+                trans->buffer_addr = t_buffer;
+
+                if (is_kvaddr(t_to_proc)) {
+                    auto p_it = diag_procs_by_addr.find(t_to_proc);
+                    if (p_it != diag_procs_by_addr.end()) {
+                        trans->to_pid = p_it->second->pid;
+                        trans->to_proc_name = p_it->second->comm;
+                    }
+                }
+
+                if (is_kvaddr(t_to_thread)) {
+                    auto t_it = diag_threads_by_addr.find(t_to_thread);
+                    if (t_it != diag_threads_by_addr.end()) {
+                        trans->to_tid = t_it->second->pid;
+                        trans->to_thread_name = t_it->second->comm;
+                        if (trans->to_pid == 0) trans->to_pid = t_it->second->proc_pid;
+                        if (trans->to_proc_name.empty()) trans->to_proc_name = t_it->second->proc_name;
+                    }
+                }
+
+                // Deduplicate by trans_addr (thread stacks and todo may overlap)
+                bool dup = false;
+                for (const auto &ex : diag_active_transactions) {
+                    if (ex->trans_addr == trans->trans_addr) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    diag_active_transactions.push_back(trans);
+                }
+            }
+            t = t_from_parent;
+        } else if (t_to_thread == thread->thread_addr) {
+            // Incoming transaction being processed by this thread
+            auto p_it = diag_procs_by_pid.find(thread->proc_pid);
+            if (p_it != diag_procs_by_pid.end()) {
+                p_it->second->active_threads++;
+            }
+            t = t_to_parent;
+        } else {
+            break;
+        }
+    }
+}
+
+void Binder::collect_diag_data() {
+    diag_procs_by_addr.clear();
+    diag_procs_by_pid.clear();
+    diag_threads_by_addr.clear();
+    diag_threads_by_tid.clear();
+    diag_active_transactions.clear();
+
+    if (!csymbol_exists("binder_procs")) {
+        LOGE("binder_procs doesn't exist in this kernel!\n");
+        return;
+    }
+
+    ulong binder_procs = csymbol_value("binder_procs");
+    if (!is_kvaddr(binder_procs)) {
+        LOGE("Invalid address for binder_procs\n");
+        return;
+    }
+
+    const int offset = field_offset(binder_proc, proc_node);
+    const std::vector<ulong> proc_list = for_each_hlist(binder_procs, offset);
+
+    // Phase 1: Collect all processes, their threads, nodes, and todo queues
+    for (const auto &proc_addr : proc_list) {
+        if (!is_kvaddr(proc_addr)) continue;
+
+        void *binder_proc_buf = read_struct(proc_addr, "binder_proc");
+        if (!binder_proc_buf) continue;
+
+        auto proc = std::make_shared<BinderDiagProc>();
+        proc->proc_addr = proc_addr;
+        proc->pid = INT(binder_proc_buf + field_offset(binder_proc, pid));
+        proc->tsk = ULONG(binder_proc_buf + field_offset(binder_proc, tsk));
+        proc->is_dead = BOOL(binder_proc_buf + field_offset(binder_proc, is_dead));
+        proc->is_frozen = BOOL(binder_proc_buf + field_offset(binder_proc, is_frozen));
+        proc->max_threads = INT(binder_proc_buf + field_offset(binder_proc, max_threads));
+        proc->requested_threads = INT(binder_proc_buf + field_offset(binder_proc, requested_threads));
+        proc->requested_threads_started = INT(binder_proc_buf + field_offset(binder_proc, requested_threads_started));
+
+        ulong context_addr = ULONG(binder_proc_buf + field_offset(binder_proc, context));
+        ulong threads_rb_node = ULONG(binder_proc_buf + field_offset(binder_proc, threads) + field_offset(rb_root, rb_node));
+        ulong nodes_rb_node = ULONG(binder_proc_buf + field_offset(binder_proc, nodes) + field_offset(rb_root, rb_node));
+        ulong waiting_threads_next = ULONG(binder_proc_buf + field_offset(binder_proc, waiting_threads) + field_offset(list_head, next));
+        ulong list_head_todo = ULONG(binder_proc_buf + field_offset(binder_proc, todo));
+        ulong alloc_addr = proc_addr + field_offset(binder_proc, alloc);
+
+        FREEBUF(binder_proc_buf);
+
+        // Read context name
+        if (is_kvaddr(context_addr)) {
+            ulong name_addr = read_structure_field(context_addr, "binder_context", "name");
+            if (is_kvaddr(name_addr)) {
+                proc->context_name = read_cstring(name_addr, 16, "binder_context_name");
+            }
+        }
+        if (proc->context_name.empty()) {
+            proc->context_name = "[unknown]";
+        }
+
+        // Read comm
+        if (is_kvaddr(proc->tsk)) {
+            proc->comm = read_cstring(proc->tsk + field_offset(task_struct, comm), 16, "task_struct_comm");
+        }
+        if (proc->comm.empty()) {
+            struct task_context *tc = pid_to_context(proc->pid);
+            if (tc) proc->comm = tc->comm;
+            else proc->comm = "[pid:" + std::to_string(proc->pid) + "]";
+        }
+
+        // Read alloc info
+        if (is_kvaddr(alloc_addr)) {
+            void *alloc_buf = read_struct(alloc_addr, "binder_alloc");
+            if (alloc_buf) {
+                proc->buffer_size = ULONG(alloc_buf + field_offset(binder_alloc, buffer_size));
+                proc->free_async_space = ULONG(alloc_buf + field_offset(binder_alloc, free_async_space));
+                FREEBUF(alloc_buf);
+            }
+        }
+
+        // Collect threads
+        collect_diag_threads(proc, threads_rb_node, waiting_threads_next);
+
+        // Collect async_todo from nodes
+        if (nodes_rb_node) {
+            std::vector<ulong> node_list = for_each_rbtree(nodes_rb_node, field_offset(binder_node, rb_node));
+            for (ulong node_addr : node_list) {
+                if (!is_kvaddr(node_addr)) continue;
+                std::vector<ulong> async_works = for_each_list(node_addr + field_offset(binder_node, async_todo), field_offset(binder_work, entry));
+                proc->async_todo_count += (int)async_works.size();
+            }
+        }
+
+        // Collect todo items
+        collect_diag_todo(proc, list_head_todo);
+
+        diag_procs_by_addr[proc->proc_addr] = proc;
+        diag_procs_by_pid[proc->pid] = proc;
+    }
+
+    // Phase 2: Now collect active transactions from threads
+    for (const auto &kv : diag_threads_by_addr) {
+        collect_diag_thread_transactions(kv.second);
+    }
+}
+
+/**
+ * Tarjan's strongly connected components algorithm.
+ * Finds all non-trivial SCCs (size >= 2) which represent cycles in the
+ * thread-level dependency graph.
+ *
+ * @param adj Adjacency list: from_tid -> set of to_tids
+ * @return Vector of SCCs, each SCC is a vector of TIDs forming the cycle
+ */
+std::vector<std::vector<int>> Binder::find_dependency_cycles(
+    const std::map<int, std::set<int>> &adj) {
+
+    std::vector<std::vector<int>> cycles;
+    std::map<int, int> index_of, lowlink;
+    std::set<int> on_stack;
+    std::vector<int> stack;
+    int idx = 0;
+
+    std::function<void(int)> strongconnect = [&](int v) {
+        index_of[v] = lowlink[v] = idx++;
+        stack.push_back(v);
+        on_stack.insert(v);
+
+        auto it = adj.find(v);
+        if (it != adj.end()) {
+            for (int w : it->second) {
+                if (index_of.find(w) == index_of.end()) {
+                    strongconnect(w);
+                    lowlink[v] = std::min(lowlink[v], lowlink[w]);
+                } else if (on_stack.find(w) != on_stack.end()) {
+                    lowlink[v] = std::min(lowlink[v], index_of[w]);
+                }
+            }
+        }
+
+        // Root of an SCC?
+        if (lowlink[v] == index_of[v]) {
+            std::vector<int> scc;
+            int w;
+            do {
+                w = stack.back();
+                stack.pop_back();
+                on_stack.erase(w);
+                scc.push_back(w);
+            } while (w != v);
+
+            // Only non-trivial SCCs (size >= 2) are actual cycles
+            if (scc.size() >= 2) {
+                cycles.push_back(scc);
+            }
+        }
+    };
+
+    for (const auto &kv : adj) {
+        if (index_of.find(kv.first) == index_of.end()) {
+            strongconnect(kv.first);
+        }
+    }
+
+    return cycles;
+}
+
+/**
+ * Walk the subgraph restricted to scc_set to find an actual cycle path.
+ * Returns a sequence where each consecutive pair is an edge within the SCC.
+ */
+std::vector<int> Binder::find_cycle_path(std::set<int> &scc_set, const std::map<int, std::set<int>> &adj) {
+    std::vector<int> path;
+    std::set<int> visited;
+
+    // DFS within SCC to find a cycle
+    std::function<bool(int, std::vector<int>&)> dfs = [&](int start, std::vector<int> &trace) {
+        if (visited.find(start) != visited.end()) {
+            return false;
+        }
+        visited.insert(start);
+        trace.push_back(start);
+
+        auto it = adj.find(start);
+        if (it != adj.end()) {
+            for (int next : it->second) {
+                if (scc_set.find(next) == scc_set.end()) continue;
+                if (visited.find(next) != visited.end()) {
+                    // Found cycle — extract path from next to current
+                    bool in_cycle = false;
+                    for (int node : trace) {
+                        if (node == next) in_cycle = true;
+                        if (in_cycle) path.push_back(node);
+                    }
+                    path.push_back(next); // close the loop
+                    return true;
+                }
+                std::vector<int> child_trace = trace;
+                if (dfs(next, child_trace)) {
+                    // Reconstruct from child_trace which has the cycle
+                    path = child_trace;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // Try each node in SCC as starting point
+    for (int start : scc_set) {
+        std::vector<int> trace;
+        if (dfs(start, trace)) {
+            return path;
+        }
+    }
+
+    // Fallback: just return all nodes (shouldn't happen if SCC is valid)
+    return std::vector<int>(scc_set.begin(), scc_set.end());
+}
+
+/**
+ * Look up the transaction associated with edge from_tid -> to_tid.
+ */
+std::shared_ptr<BinderDiagTransaction> Binder::find_edge_transaction(int from_tid, int to_tid) {
+    for (const auto &t : diag_active_transactions) {
+        if (t->from_tid == from_tid && t->to_tid == to_tid) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+void Binder::print_diag_overview() {
+    int total_procs = diag_procs_by_pid.size();
+    int total_threads = diag_threads_by_tid.size();
+    int ready_threads = 0;
+    int starved_procs = 0;
+    int congested_procs = 0;
+
+    for (const auto &kv : diag_procs_by_pid) {
+        ready_threads += kv.second->ready_threads;
+        if (kv.second->ready_threads == 0 && kv.second->total_threads >= kv.second->max_threads && kv.second->max_threads > 0) {
+            starved_procs++;
+        }
+        if (kv.second->todo_count > 5 || kv.second->async_todo_count > 5) {
+            congested_procs++;
+        }
+    }
+
+    std::map<int, std::set<int>> adj;
+    for (const auto &t : diag_active_transactions) {
+        if (t->from_tid > 0 && t->to_tid > 0 && t->from_tid != t->to_tid) {
+            adj[t->from_tid].insert(t->to_tid);
+        }
+    }
+    auto cycles = find_dependency_cycles(adj);
+
+    PRINT("Binder IPC System Overview & Diagnostics\n");
+    PRINT("==============================================================================\n");
+    PRINT("  Binder Processes:       %-10d Total Binder Threads: %-10d\n", total_procs, total_threads);
+    PRINT("  Ready/Waiting Threads:  %-10d Active Sync Calls:     %-10zu\n", ready_threads, diag_active_transactions.size());
+    PRINT("  Starved Processes:      %-10d Congested Queues (>5): %-10d\n", starved_procs, congested_procs);
+    PRINT("  Dependency Cycles:      %-10zu\n", cycles.size());
+    PRINT("------------------------------------------------------------------------------\n");
+    PRINT("  Health Assessment:\n");
+
+    if (!cycles.empty()) {
+        PRINT("  [!] %zu dependency cycle(s) detected in Binder transactions!\n", cycles.size());
+        PRINT("      Run 'binder -d' to view thread dependency cycles.\n");
+    } else if (starved_procs > 0) {
+        PRINT("  [!] %d process(es) have exhausted their thread pools!\n", starved_procs);
+        PRINT("      Run 'binder -s' to view starved processes.\n");
+    } else if (diag_active_transactions.empty()) {
+        PRINT("  [+] No active synchronous Binder transactions in flight. System is idle.\n");
+    } else {
+        PRINT("  [*] %zu active sync call(s) in progress. No circular dependencies found.\n", diag_active_transactions.size());
+        PRINT("      Run 'binder -c' to inspect transaction wait chains.\n");
+    }
+    PRINT("==============================================================================\n");
+}
+
+void Binder::print_diag_call_chains() {
+    if (diag_active_transactions.empty()) {
+        PRINT("No active synchronous Binder transactions found in the system.\n");
+        return;
+    }
+
+    std::map<int, std::shared_ptr<BinderDiagTransaction>> caller_map;
+    std::set<int> callees;
+    for (const auto &t : diag_active_transactions) {
+        if (t->from_tid > 0) {
+            caller_map[t->from_tid] = t;
+        }
+        if (t->to_tid > 0) {
+            callees.insert(t->to_tid);
+        }
+    }
+
+    std::vector<int> roots;
+    for (const auto &kv : caller_map) {
+        if (callees.find(kv.first) == callees.end()) {
+            roots.push_back(kv.first);
+        }
+    }
+    if (roots.empty()) {
+        for (const auto &kv : caller_map) {
+            roots.push_back(kv.first);
+        }
+    }
+
+    PRINT("Synchronous Binder Transaction Call Chains\n");
+    PRINT("==============================================================================\n");
+
+    std::set<int> printed_roots;
+    for (int root_tid : roots) {
+        if (printed_roots.find(root_tid) != printed_roots.end()) continue;
+
+        auto root_trans = caller_map[root_tid];
+        if (!root_trans) continue;
+
+        PRINT("Chain originating from [%d:%d] %s (%s):\n",
+              root_trans->from_pid, root_trans->from_tid,
+              root_trans->from_proc_name.c_str(), root_trans->from_thread_name.c_str());
+
+        int curr_tid = root_tid;
+        int depth = 0;
+        std::set<int> chain_visited;
+        std::shared_ptr<BinderDiagTransaction> last_trans = nullptr;
+
+        while (curr_tid > 0) {
+            if (chain_visited.find(curr_tid) != chain_visited.end()) {
+                PRINT("    [!] Cycle detected back to TID %d\n", curr_tid);
+                break;
+            }
+            chain_visited.insert(curr_tid);
+            printed_roots.insert(curr_tid);
+
+            auto it = caller_map.find(curr_tid);
+            if (it == caller_map.end()) break;
+            auto trans = it->second;
+            last_trans = trans;
+
+            std::string indent(depth * 2, ' ');
+            std::string target_desc;
+            if (trans->to_tid > 0) {
+                std::string target_st = "[unknown]";
+                auto t_it = diag_threads_by_tid.find(trans->to_tid);
+                if (t_it != diag_threads_by_tid.end()) {
+                    target_st = t_it->second->state_str;
+                }
+                target_desc = "[" + std::to_string(trans->to_pid) + ":" + std::to_string(trans->to_tid) + "] " +
+                              trans->to_proc_name + " (" + trans->to_thread_name + ") [State: " + target_st + "]";
+            } else {
+                target_desc = "[" + std::to_string(trans->to_pid) + ":todo] " + trans->to_proc_name + " (Pending in Todo Queue)";
+            }
+
+            PRINT("%s  └─► %s (trans: %#lx id:%u code:%u)\n",
+                  indent.c_str(), target_desc.c_str(), trans->trans_addr, trans->debug_id, trans->code);
+
+            curr_tid = trans->to_tid;
+            depth++;
+        }
+
+        // Diagnostic hint for the leaf of this chain
+        if (last_trans) {
+            std::string indent(depth * 2, ' ');
+            if (last_trans->to_tid > 0) {
+                auto leaf_t_it = diag_threads_by_tid.find(last_trans->to_tid);
+                if (leaf_t_it != diag_threads_by_tid.end()) {
+                    auto leaf_t = leaf_t_it->second;
+                    if (leaf_t->state_str.find("UN") != std::string::npos || leaf_t->state_str.find("D") != std::string::npos) {
+                        PRINT("%s  ▲ Candidate Blocker: Leaf thread blocked in D-state (wchan: %s)\n",
+                              indent.c_str(), leaf_t->wchan.c_str());
+                    } else if (leaf_t->state_str.find("RU") != std::string::npos || leaf_t->state_str.find("R") != std::string::npos) {
+                        PRINT("%s  ▲ Leaf thread is currently RUNNING on CPU\n", indent.c_str());
+                    } else {
+                        PRINT("%s  ▲ Leaf thread is waiting in kernel (wchan: %s)\n",
+                              indent.c_str(), leaf_t->wchan.c_str());
+                    }
+                }
+            } else {
+                auto p_it = diag_procs_by_pid.find(last_trans->to_pid);
+                if (p_it != diag_procs_by_pid.end() && p_it->second->ready_threads == 0 && p_it->second->total_threads >= p_it->second->max_threads) {
+                    PRINT("%s  ▲ Candidate Blocker: Potential starvation in %s (0 ready threads, %d/%d active)\n",
+                          indent.c_str(), p_it->second->comm.c_str(), p_it->second->total_threads, p_it->second->max_threads);
+                } else {
+                    PRINT("%s  ▲ Transaction is pending in process todo queue\n", indent.c_str());
+                }
+            }
+        }
+        PRINT("------------------------------------------------------------------------------\n");
+    }
+}
+
+void Binder::print_diag_dependency_cycles() {
+    std::map<int, std::set<int>> adj;
+
+    for (const auto &t : diag_active_transactions) {
+        if (t->from_tid > 0 && t->to_tid > 0 && t->from_tid != t->to_tid) {
+            adj[t->from_tid].insert(t->to_tid);
+        }
+    }
+
+    auto sccs = find_dependency_cycles(adj);
+
+    PRINT("Binder IPC Dependency Cycle Detection (Thread-level)\n");
+    PRINT("==============================================================================\n");
+
+    if (sccs.empty()) {
+        PRINT("  No thread-level circular dependencies detected in Binder IPC graph.\n");
+        PRINT("  All synchronous transactions are arranged in acyclic dependency paths.\n");
+        PRINT("==============================================================================\n");
+        return;
+    }
+
+    PRINT("  [!] Detected %zu dependency cycle(s) (potential circular deadlock):\n\n", sccs.size());
+
+    int c_idx = 1;
+    for (const auto &scc : sccs) {
+        // Extract actual cycle path within SCC via DFS
+        std::set<int> scc_set(scc.begin(), scc.end());
+        std::vector<int> cycle = find_cycle_path(scc_set, adj);
+
+        PRINT("  Dependency Cycle #%d (%zu threads in loop):\n", c_idx++, cycle.size());
+        for (size_t i = 0; i < cycle.size(); ++i) {
+            int u = cycle[i];
+            int v = cycle[(i + 1) % cycle.size()];
+            auto trans = find_edge_transaction(u, v);
+            std::string u_proc = trans ? trans->from_proc_name : "unknown";
+            std::string u_comm = trans ? trans->from_thread_name : "unknown";
+            std::string v_proc = trans ? trans->to_proc_name : "unknown";
+            std::string v_comm = trans ? trans->to_thread_name : "unknown";
+            unsigned int debug_id = trans ? trans->debug_id : 0;
+            unsigned int code = trans ? trans->code : 0;
+
+            PRINT("    TID %-6d [%s:%s] --(trans: %u, code: %u)--> TID %-6d [%s:%s]\n",
+                  u, u_proc.c_str(), u_comm.c_str(), debug_id, code,
+                  v, v_proc.c_str(), v_comm.c_str());
+        }
+        PRINT("\n");
+    }
+    PRINT("  Note: Circular wait detected between the threads above.\n");
+    PRINT("==============================================================================\n");
+}
+
+struct BinderDiagBlockerStats {
+    int pid = 0;
+    std::string proc_name;
+    int total_transactions = 0;
+    std::set<int> blocked_pids;
+    std::set<int> blocked_tids;
+};
+
+void Binder::print_diag_top_blockers() {
+    std::map<int, BinderDiagBlockerStats> stats_map;
+
+    for (const auto &t : diag_active_transactions) {
+        if (t->to_pid <= 0) continue;
+        auto &st = stats_map[t->to_pid];
+        st.pid = t->to_pid;
+        st.proc_name = t->to_proc_name;
+        st.total_transactions++;
+        if (t->from_pid > 0) st.blocked_pids.insert(t->from_pid);
+        if (t->from_tid > 0) st.blocked_tids.insert(t->from_tid);
+    }
+
+    std::vector<BinderDiagBlockerStats> stats_list;
+    for (const auto &kv : stats_map) {
+        stats_list.push_back(kv.second);
+    }
+
+    std::sort(stats_list.begin(), stats_list.end(),
+              [](const BinderDiagBlockerStats &a, const BinderDiagBlockerStats &b) {
+                  if (a.blocked_tids.size() != b.blocked_tids.size())
+                      return a.blocked_tids.size() > b.blocked_tids.size();
+                  return a.total_transactions > b.total_transactions;
+              });
+
+    PRINT("Top Binder Blocker Processes Ranking\n");
+    PRINT("%-5s %-7s %-24s %-16s %-16s %-12s\n", "Rank", "PID", "Process Name", "Blocked Procs", "Blocked Threads", "Total Trans");
+    PRINT("----------------------------------------------------------------------------------------\n");
+
+    if (stats_list.empty()) {
+        PRINT("  No active blocking transactions found.\n");
+        PRINT("----------------------------------------------------------------------------------------\n");
+        return;
+    }
+
+    int rank = 1;
+    for (const auto &st : stats_list) {
+        std::string name_str = st.proc_name.empty() ? "[unknown]" : st.proc_name;
+        if (name_str.length() > 23) name_str = name_str.substr(0, 20) + "...";
+
+        PRINT("%-5d %-7d %-24s %-16zu %-16zu %-12d\n",
+              rank, st.pid, name_str.c_str(),
+              st.blocked_pids.size(), st.blocked_tids.size(), st.total_transactions);
+        rank++;
+    }
+    PRINT("----------------------------------------------------------------------------------------\n");
+}
+
+void Binder::print_diag_thread_starvation() {
+    std::vector<std::shared_ptr<BinderDiagProc>> starved;
+    std::vector<std::shared_ptr<BinderDiagProc>> warning;
+
+    for (const auto &kv : diag_procs_by_pid) {
+        auto p = kv.second;
+        if (p->ready_threads == 0 && p->total_threads >= p->max_threads && p->max_threads > 0) {
+            starved.push_back(p);
+        } else if (p->ready_threads == 0 && p->todo_count > 0) {
+            warning.push_back(p);
+        }
+    }
+
+    PRINT("Binder Thread Pool Starvation Diagnosis\n");
+    PRINT("%-7s %-24s %-12s %-12s %-12s %-12s %-8s\n",
+          "PID", "Process Name", "Ready", "Total", "Max", "Todo Queue", "Status");
+    PRINT("----------------------------------------------------------------------------------------\n");
+
+    if (starved.empty() && warning.empty()) {
+        PRINT("  No thread pool starvation detected. All processes have available threads.\n");
+        PRINT("----------------------------------------------------------------------------------------\n");
+        return;
+    }
+
+    for (const auto &p : starved) {
+        std::string name_str = p->comm.empty() ? "[unknown]" : p->comm;
+        if (name_str.length() > 23) name_str = name_str.substr(0, 20) + "...";
+        PRINT("%-7d %-24s %-12d %-12d %-12d %-12d %-8s\n",
+              p->pid, name_str.c_str(), p->ready_threads, p->total_threads,
+              p->max_threads, p->todo_count, "[STARVED]");
+    }
+
+    for (const auto &p : warning) {
+        std::string name_str = p->comm.empty() ? "[unknown]" : p->comm;
+        if (name_str.length() > 23) name_str = name_str.substr(0, 20) + "...";
+        PRINT("%-7d %-24s %-12d %-12d %-12d %-12d %-8s\n",
+              p->pid, name_str.c_str(), p->ready_threads, p->total_threads,
+              p->max_threads, p->todo_count, "[BUSY]");
+    }
+    PRINT("----------------------------------------------------------------------------------------\n");
+}
+
+void Binder::print_diag_queue_and_oneway() {
+    std::vector<std::shared_ptr<BinderDiagProc>> procs;
+    for (const auto &kv : diag_procs_by_pid) {
+        if (kv.second->todo_count > 0 || kv.second->async_todo_count > 0) {
+            procs.push_back(kv.second);
+        }
+    }
+
+    std::sort(procs.begin(), procs.end(),
+              [](const std::shared_ptr<BinderDiagProc> &a, const std::shared_ptr<BinderDiagProc> &b) {
+                  return (a->todo_count + a->async_todo_count) > (b->todo_count + b->async_todo_count);
+              });
+
+    PRINT("Binder Pending Todo Queues & Async (Oneway) Analysis\n");
+    PRINT("%-7s %-24s %-12s %-14s %-14s %-14s\n",
+          "PID", "Process Name", "Todo Items", "Async Todo", "Buffer Size", "Free Async");
+    PRINT("----------------------------------------------------------------------------------------\n");
+
+    if (procs.empty()) {
+        PRINT("  No pending transactions or async queued items detected.\n");
+        PRINT("----------------------------------------------------------------------------------------\n");
+        return;
+    }
+
+    int total_pending = 0;
+    int total_async = 0;
+    for (const auto &p : procs) {
+        total_pending += p->todo_count;
+        total_async += p->async_todo_count;
+        std::string name_str = p->comm.empty() ? "[unknown]" : p->comm;
+        if (name_str.length() > 23) name_str = name_str.substr(0, 20) + "...";
+
+        char buf_str[32], async_str[32];
+        snprintf(buf_str, sizeof(buf_str), "%lu KB", p->buffer_size / 1024);
+        snprintf(async_str, sizeof(async_str), "%lu KB", p->free_async_space / 1024);
+
+        PRINT("%-7d %-24s %-12d %-14d %-14s %-14s\n",
+              p->pid, name_str.c_str(), p->todo_count, p->async_todo_count, buf_str, async_str);
+    }
+    PRINT("----------------------------------------------------------------------------------------\n");
+    PRINT("Total pending sync todo: %d, Total pending async todo: %d\n", total_pending, total_async);
 }
 #pragma GCC diagnostic pop

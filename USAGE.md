@@ -1327,6 +1327,81 @@ binder_proc:0xffffff801a7a5400 ndroid.settings [4268] binder dead:0 frozen:0 sr:
   binder_ref:0xffffff80538f2480 id:97811 desc:2 s:1 w:1 death:0 -> node_id:4401 binder_proc:0xffffff8016b5ac00 system_server[1067]
 ```
 
+### binder -o
+Display diagnostic overview and health assessment.
+```
+crash> binder -o
+Binder IPC System Overview & Diagnostics
+==============================================================================
+  Binder Processes:       38         Total Binder Threads: 154
+  Ready/Waiting Threads:  92         Active Sync Calls:     3
+  Starved Processes:      0          Congested Queues (>5): 0
+  Dependency Cycles:      0
+------------------------------------------------------------------------------
+  Health Assessment:
+  [*] 3 active sync call(s) in progress. No circular dependencies found.
+      Run 'binder -c' to inspect transaction wait chains.
+==============================================================================
+```
+
+### binder -c
+Display synchronous call chains (multi-hop transaction wait paths) and candidate blockers.
+```
+crash> binder -c
+Synchronous Binder Transaction Call Chains
+==============================================================================
+Chain originating from [1067:2341] system_server (ActivityManager):
+  └─► [2150:2150] com.android.phone (PhoneApp) [State: RU] (trans: 0xffffff804f812000 id:409173 code:12)
+    ▲ Leaf thread is currently RUNNING on CPU
+------------------------------------------------------------------------------
+```
+
+### binder -d
+Detect thread-level dependency cycles (potential circular deadlocks).
+```
+crash> binder -d
+Binder IPC Dependency Cycle Detection (Thread-level)
+==============================================================================
+  No thread-level circular dependencies detected in Binder IPC graph.
+  All synchronous transactions are arranged in acyclic dependency paths.
+==============================================================================
+```
+
+### binder -B
+Rank top blocker processes causing downstream thread waits.
+```
+crash> binder -B
+Top Binder Blocker Processes Ranking
+Rank  PID     Process Name             Blocked Procs    Blocked Threads  Total Trans 
+----------------------------------------------------------------------------------------
+1     1067    system_server            3                5                5           
+2     504     servicemanager           1                1                1           
+----------------------------------------------------------------------------------------
+```
+
+### binder -s
+Diagnose binder thread pool starvation.
+```
+crash> binder -s
+Binder Thread Pool Starvation Diagnosis
+PID     Process Name             Ready        Total        Max          Todo Queue   Status  
+----------------------------------------------------------------------------------------
+  No thread pool starvation detected. All processes have available threads.
+----------------------------------------------------------------------------------------
+```
+
+### binder -q
+Analyze pending todo queues and asynchronous oneway queues.
+```
+crash> binder -q
+Binder Pending Todo Queues & Async (Oneway) Analysis
+PID     Process Name             Todo Items   Async Todo     Buffer Size    Free Async    
+----------------------------------------------------------------------------------------
+1067    system_server            2            1              1024 KB        512 KB        
+----------------------------------------------------------------------------------------
+Total pending sync todo: 2, Total pending async todo: 1
+```
+
 ## cpu
 This command dumps the cpu info.
 

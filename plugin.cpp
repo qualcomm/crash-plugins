@@ -66,6 +66,12 @@ ParserPlugin::ParserPlugin(){
     field_init(task_struct, mm);
     field_init(task_struct, tasks);
     field_init(task_struct, files);
+    field_init(task_struct, thread);
+    struct_init(thread_struct);
+    field_init(thread_struct, cpu_context);
+    struct_init(cpu_context);
+    field_init(cpu_context, fp);
+    field_init(cpu_context, pc);
 
     // File descriptor structures
     field_init(files_struct, fdt);
@@ -869,42 +875,45 @@ std::vector<ulong> ParserPlugin::for_each_anon_page(){
 /**
  * Retrieve all entries from a radix tree data structure
  *
- * This function traverses a radix tree starting from the given root node and
+ * This function traverses a radix tree starting from the given root address and
  * collects all valid kernel virtual addresses stored within the tree. Radix trees
- * are used extensively in the Linux kernel for efficient storage and retrieval
- * of data indexed by integer keys (such as page cache lookups by page index).
+ * are used in Linux kernels for sparse array storage, such as PID tables and
+ * process address space management.
  *
  * The function performs a two-pass operation:
  * 1. First pass: Count the total number of entries in the radix tree
  * 2. Second pass: Gather all the entries into a temporary buffer
  * 3. Filter and return only valid kernel virtual addresses
  *
- * @param root_rnode The kernel virtual address of the radix tree root node
+ * @param root_rnode The kernel virtual address of the radix tree root
  * @return Vector of kernel virtual addresses found in the radix tree
  *         Returns empty vector if root is invalid or no entries found
  *
  */
 std::vector<ulong> ParserPlugin::for_each_radix(ulong root_rnode){
-    std::vector<ulong> res;
-    if (!is_kvaddr(root_rnode)) {
-        return res;
-    }
-    size_t entry_num = do_radix_tree(root_rnode, RADIX_TREE_COUNT, NULL);
-    if (entry_num == 0) {
-        return res;
-    }
-    struct list_pair *entry_list = (struct list_pair *)GETBUF((entry_num + 1) * sizeof(struct list_pair));
-    entry_list[0].index = entry_num;
-    do_radix_tree(root_rnode, RADIX_TREE_GATHER, entry_list);
-    res.reserve(entry_num);
-    for (size_t i = 0; i < entry_num; ++i){
-        ulong addr = (ulong)entry_list[i].value;
-        if (is_kvaddr(addr)) {
-            res.push_back(addr);
-        }
-    }
-    FREEBUF(entry_list);
-    return res;
+    return for_each_tree_impl(root_rnode,
+        [](ulong ptr, int, struct list_pair*) -> size_t { return do_radix_tree(ptr, RADIX_TREE_COUNT, NULL); },
+        [](ulong ptr, int, struct list_pair* list) -> ulong { return do_radix_tree(ptr, RADIX_TREE_GATHER, list); },
+        [](const struct list_pair& p) -> ulong { return (ulong)p.value; });
+}
+
+/**
+ * Retrieve all entries from a radix tree with their indices
+ *
+ * Similar to for_each_radix(), but returns both the index and value for each
+ * entry. This is useful when the position of an entry within the tree matters
+ * (e.g., sequential numbering of PIDs or page cache slots).
+ *
+ * @param root_rnode The kernel virtual address of the radix tree root
+ * @return Vector of TreeEntry (index + value) for valid kernel virtual addresses
+ *         Returns empty vector if root is invalid or no entries found
+ *
+ */
+std::vector<TreeEntry> ParserPlugin::for_each_radix_with_index(ulong root_rnode){
+    return for_each_tree_impl(root_rnode,
+        [](ulong ptr, int, struct list_pair*) -> size_t { return do_radix_tree(ptr, RADIX_TREE_COUNT, NULL); },
+        [](ulong ptr, int, struct list_pair* list) -> ulong { return do_radix_tree(ptr, RADIX_TREE_GATHER, list); },
+        [](const struct list_pair& p) -> TreeEntry { return {p.index, (ulong)p.value}; });
 }
 
 /**
@@ -926,25 +935,29 @@ std::vector<ulong> ParserPlugin::for_each_radix(ulong root_rnode){
  *
  */
 std::vector<ulong> ParserPlugin::for_each_mptree(ulong maptree_addr){
-    std::vector<ulong> res;
-    if (!is_kvaddr(maptree_addr)) {
-        return res;
-    }
-    size_t entry_num = do_maple_tree(maptree_addr, MAPLE_TREE_COUNT, NULL);
-    if (entry_num == 0) {
-        return res;
-    }
-    struct list_pair *entry_list = (struct list_pair *)GETBUF(entry_num * sizeof(struct list_pair));
-    do_maple_tree(maptree_addr, MAPLE_TREE_GATHER, entry_list);
-    res.reserve(entry_num);
-    for (size_t i = 0; i < entry_num; ++i){
-        ulong addr = (ulong)entry_list[i].value;
-        if (is_kvaddr(addr)) {
-            res.push_back(addr);
-        }
-    }
-    FREEBUF(entry_list);
-    return res;
+    return for_each_tree_impl(maptree_addr,
+        [](ulong ptr, int, struct list_pair*) -> size_t { return do_maple_tree(ptr, MAPLE_TREE_COUNT, NULL); },
+        [](ulong ptr, int, struct list_pair* list) -> ulong { return do_maple_tree(ptr, MAPLE_TREE_GATHER, list); },
+        [](const struct list_pair& p) -> ulong { return (ulong)p.value; });
+}
+
+/**
+ * Retrieve all entries from a maple tree with their indices
+ *
+ * Similar to for_each_mptree(), but returns both the index and value for each
+ * entry. Maple trees replace red-black trees in modern kernels (6.1+) for
+ * memory management structures like VMA storage.
+ *
+ * @param maptree_addr The kernel virtual address of the maple tree root
+ * @return Vector of TreeEntry (index + value) for valid kernel virtual addresses
+ *         Returns empty vector if root is invalid or no entries found
+ *
+ */
+std::vector<TreeEntry> ParserPlugin::for_each_mptree_with_index(ulong maptree_addr){
+    return for_each_tree_impl(maptree_addr,
+        [](ulong ptr, int, struct list_pair*) -> size_t { return do_maple_tree(ptr, MAPLE_TREE_COUNT, NULL); },
+        [](ulong ptr, int, struct list_pair* list) -> ulong { return do_maple_tree(ptr, MAPLE_TREE_GATHER, list); },
+        [](const struct list_pair& p) -> TreeEntry { return {p.index, (ulong)p.value}; });
 }
 
 /**
@@ -966,25 +979,29 @@ std::vector<ulong> ParserPlugin::for_each_mptree(ulong maptree_addr){
  *
  */
 std::vector<ulong> ParserPlugin::for_each_xarray(ulong xarray_addr){
-    std::vector<ulong> res;
-    if (!is_kvaddr(xarray_addr)) {
-        return res;
-    }
-    size_t entry_num = do_xarray(xarray_addr, XARRAY_COUNT, NULL);
-    if (entry_num == 0) {
-        return res;
-    }
-    struct list_pair *entry_list = (struct list_pair *)GETBUF(entry_num * sizeof(struct list_pair));
-    do_xarray(xarray_addr, XARRAY_GATHER, entry_list);
-    res.reserve(entry_num);
-    for (size_t i = 0; i < entry_num; ++i) {
-        ulong addr = (ulong)entry_list[i].value;
-        if (is_kvaddr(addr)) {
-            res.push_back(addr);
-        }
-    }
-    FREEBUF(entry_list);
-    return res;
+    return for_each_tree_impl(xarray_addr,
+        [](ulong ptr, int, struct list_pair*) -> size_t { return do_xarray(ptr, XARRAY_COUNT, NULL); },
+        [](ulong ptr, int, struct list_pair* list) -> ulong { return do_xarray(ptr, XARRAY_GATHER, list); },
+        [](const struct list_pair& p) -> ulong { return (ulong)p.value; });
+}
+
+/**
+ * Retrieve all entries from an xarray with their indices
+ *
+ * Similar to for_each_xarray(), but returns both the index and value for each
+ * entry. Xarrays are the successor to radix trees in modern kernels, used for
+ * page cache and other indexed storage.
+ *
+ * @param xarray_addr The kernel virtual address of the xarray root
+ * @return Vector of TreeEntry (index + value) for valid kernel virtual addresses
+ *         Returns empty vector if root is invalid or no entries found
+ *
+ */
+std::vector<TreeEntry> ParserPlugin::for_each_xarray_with_index(ulong xarray_addr){
+    return for_each_tree_impl(xarray_addr,
+        [](ulong ptr, int, struct list_pair*) -> size_t { return do_xarray(ptr, XARRAY_COUNT, NULL); },
+        [](ulong ptr, int, struct list_pair* list) -> ulong { return do_xarray(ptr, XARRAY_GATHER, list); },
+        [](const struct list_pair& p) -> TreeEntry { return {p.index, (ulong)p.value}; });
 }
 
 /**
@@ -4365,6 +4382,84 @@ void ParserPlugin::uwind_task_back_trace(int pid, ulong x30){
     // dump_bt_info(bt, "back_trace");
     PRINT("\n");
 #endif
+}
+
+std::vector<StackFrame> ParserPlugin::unwind_task_frames(struct task_context *tc, int max_depth) {
+    std::vector<StackFrame> frames;
+    if (!tc || !tc->task) {
+        return frames;
+    }
+#if defined(ARM64)
+    ulong fp = 0, pc = 0;
+    if (offset_table.task_struct_thread_context_fp >= 0 &&
+        offset_table.task_struct_thread_context_pc >= 0) {
+        fp = read_pointer(tc->task + offset_table.task_struct_thread_context_fp, "context_fp");
+        pc = read_pointer(tc->task + offset_table.task_struct_thread_context_pc, "context_pc");
+    } else {
+        int off_thread = field_offset(task_struct, thread);
+        int off_ctx = field_offset(thread_struct, cpu_context);
+        int off_fp = field_offset(cpu_context, fp);
+        int off_pc = field_offset(cpu_context, pc);
+        if (off_thread >= 0 && off_ctx >= 0) {
+            ulong ctx_addr = tc->task + off_thread + off_ctx;
+            if (off_fp >= 0 && off_pc >= 0) {
+                fp = read_pointer(ctx_addr + off_fp, "context_fp");
+                pc = read_pointer(ctx_addr + off_pc, "context_pc");
+            } else {
+                // Hardcoded ARM64 cpu_context fp/pc offsets as last-resort fallback
+                // when field_offset() resolution fails (expected fp=80, pc=96 in struct cpu_context)
+                fp = read_pointer(ctx_addr + 80, "context_fp");
+                pc = read_pointer(ctx_addr + 96, "context_pc");
+            }
+        }
+    }
+
+    ulong stackbase = GET_STACKBASE(tc->task);
+    ulong stacktop = GET_STACKTOP(tc->task);
+
+    if (pc && is_kvaddr(pc)) {
+        frames.push_back({fp, pc, to_symbol(pc)});
+    }
+
+    if (fp >= stackbase && fp + 16 <= stacktop) {
+        ulong curr_fp = fp;
+        std::unordered_set<ulong> visited_fps;
+        int depth = 0;
+        while (curr_fp >= stackbase && curr_fp + 16 <= stacktop && depth++ < max_depth) {
+            if (visited_fps.find(curr_fp) != visited_fps.end()) {
+                break;
+            }
+            visited_fps.insert(curr_fp);
+
+            ulong next_fp = read_pointer(curr_fp, "next_fp");
+            ulong lr = read_pointer(curr_fp + 8, "lr");
+            if (lr && is_kvaddr(lr)) {
+                frames.push_back({curr_fp, lr, to_symbol(lr)});
+            }
+            if (next_fp <= curr_fp || next_fp >= stacktop) {
+                break;
+            }
+            curr_fp = next_fp;
+        }
+    }
+#elif defined(ARM)
+    ulong stackbase = GET_STACKBASE(tc->task);
+    ulong stacktop = GET_STACKTOP(tc->task);
+    int off_thread = field_offset(task_struct, thread);
+    int off_ctx = field_offset(thread_struct, cpu_context);
+    if (off_thread >= 0 && off_ctx >= 0) {
+        ulong ctx_addr = tc->task + off_thread + off_ctx;
+        // Hardcoded ARM32 cpu_context fp/pc offsets as last-resort fallback
+        ulong fp = read_pointer(ctx_addr + 24, "arm32_fp");
+        ulong pc = read_pointer(ctx_addr + 32, "arm32_pc");
+        if (pc && is_kvaddr(pc)) {
+            frames.push_back({fp, pc, to_symbol(pc)});
+        }
+        // Note: ARM32 frame pointer ABI is not standardized enough to reliably walk the chain,
+        // so only the initial saved context is captured here.
+    }
+#endif
+    return frames;
 }
 
 /**
