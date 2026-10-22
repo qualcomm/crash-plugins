@@ -133,6 +133,7 @@ list(APPEND PLUGIN_SOURCES
     lockdep/lockdep.cpp
     lockdep/lock_decoder.cpp
     timer/timer.cpp
+    config/config.cpp
     )
 
 add_library(plugins SHARED ${PLUGIN_SOURCES})
@@ -401,4 +402,9 @@ add_plugin(timer
 # =================== build rcu ===================
 add_plugin(rcu
     rcu/rcu.cpp)
+
+# =================== build config ===================
+add_plugin(config
+    config/config.cpp)
+
 endif()

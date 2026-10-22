@@ -1,0 +1,1597 @@
+/**
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * SPDX-License-Identifier: GPL-2.0-only
+ */
+
+#include "config/config.h"
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
+#include <cstring>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpointer-arith"
+#pragma GCC diagnostic ignored "-Wwrite-strings"
+
+#ifndef BUILD_TARGET_TOGETHER
+DEFINE_PLUGIN_COMMAND(Config)
+#endif
+
+Config::Config() {}
+
+void Config::init_command(void) {
+    cmd_name = "config";
+    help_str_list = {
+        "config",
+        "inspect kernel configuration from crash dump (.config / ikconfig data)",
+        "[-a] [-s <SUBSYSTEM>] <KEY>\n"
+        "  This command reads kernel configuration from the crash dump and\n"
+        "  reports individual options or full listings. It works with ikconfig\n"
+        "  data embedded in the kernel or with .config / config.gz loaded into\n"
+        "  the crash dump (available when running against a kernel built with\n"
+        "  CONFIG_IKCONFIG or when a .config file has been loaded).\n\n"
+        "  -a               Display all kernel configuration options.\n"
+        "  -s <SUBSYSTEM>   Filter the full listing by subsystem prefix.\n"
+        "  <KEY>            Query a single kernel configuration option.",
+        "\n",
+        "EXAMPLES",
+        "  List all kernel config options:\n"
+        "    crash> config -a\n\n"
+        "  Query whether ext4 filesystem support is built in:\n"
+        "    crash> config CONFIG_EXT4_FS\n\n"
+        "  Filter to all networking-related config options:\n"
+        "    crash> config -s NET\n",
+    };
+}
+
+void Config::init_offset(void) {
+    // No structure field offsets needed for this plugin
+}
+
+/**
+ * Collect all kernel configuration entries by querying each known
+ * CONFIG_ symbol via the crash utility's get_kernel_config() API.
+ *
+ * The function iterates over a comprehensive list of kernel config names,
+ * queries each one using get_config_val(), and only retains entries that
+ * actually exist in the crash dump's ikconfig data.
+ *
+ * @return Vector of all available KernelConfig structs from the dump
+ */
+std::vector<KernelConfig> Config::collect_all_configs() {
+    std::vector<KernelConfig> result;
+
+    // Comprehensive list of kernel config option names, grouped roughly
+    // by subsystem for clarity.  We keep the list ordered so that output
+    // is deterministic and easy to scan.
+    static const char* config_names[] = {
+        // --- Architecture (ARM64) ---
+        "CONFIG_ARM64",
+        "CONFIG_ARM64_VA_BITS",
+        "CONFIG_ARM64_VA_BITS_48",
+        "CONFIG_ARM64_16K_PAGES",
+        "CONFIG_ARM64_64K_PAGES",
+        "CONFIG_ARM64_PAN",
+        "CONFIG_ARM64_UAO",
+        "CONFIG_ARM64_MTE",
+        "CONFIG_ARM64_PTR_AUTH",
+        "CONFIG_ARM64_CNP",
+        "CONFIG_ARM64_SSBD",
+        "CONFIG_ARM64_SVE",
+        "CONFIG_ARM64_AMU_EXTN",
+        "CONFIG_ARM64_TAGGED_ADDR_ABI",
+
+        // --- Architecture (ARM) ---
+        "CONFIG_ARM",
+        "CONFIG_CPU_V7",
+        "CONFIG_CPU_V7M",
+        "CONFIG_ARM_LPAE",
+
+        // --- Architecture (x86) ---
+        "CONFIG_X86",
+        "CONFIG_X86_64",
+        "CONFIG_X86_32",
+        "CONFIG_X86_LOCAL_APIC",
+        "CONFIG_X86_IO_APIC",
+        "CONFIG_X86_MPPARSE",
+        "CONFIG_X86_MSR",
+
+        // --- General Kernel ---
+        "CONFIG_CC_OPTIMIZE_FOR_SIZE",
+        "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE",
+        "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3",
+        "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O2",
+        "CONFIG_DEBUG_KERNEL",
+        "CONFIG_DEBUG_INFO",
+        "CONFIG_DEBUG_INFO_DWARF4",
+        "CONFIG_DEBUG_INFO_DWARF5",
+        "CONFIG_DEBUG_INFO_REDUCED",
+        "CONFIG_EXPERT",
+        "CONFIG_UID16",
+        "CONFIG_MULTIUSER",
+        "CONFIG_GENERIC_CMOS_UPDATE",
+        "CONFIG_GENERIC_CSUM",
+        "CONFIG_GENERIC_CALIBRATE_DELAY",
+        "CONFIG_HAVE_GENERIC_DMA_COHERENT",
+        "CONFIG_SLAB",
+        "CONFIG_SLUB",
+        "CONFIG_SLOB",
+        "CONFIG_PROC_FS",
+        "CONFIG_SYSFS",
+        "CONFIG_TMPFS",
+        "CONFIG_BASE_FULL",
+        "CONFIG_FUTEX",
+        "CONFIG_EPOLL",
+        "CONFIG_SIGNALFD",
+        "CONFIG_TIMERFD",
+        "CONFIG_EVENTFD",
+        "CONFIG_INOTIFY_USER",
+        "CONFIG_PAGE_COUNTER",
+        "CONFIG_MEMCG",
+        "CONFIG_MEMCG_SWAP",
+        "CONFIG_MEMCG_KMEM",
+        "CONFIG_KERNEL_zstd",
+        "CONFIG_KERNEL_LZ4",
+        "CONFIG_CFI_CLANG",
+        "CONFIG_CFI_PERMISSIVE",
+        "CONFIG_SMP",
+        "CONFIG_PREEMPT",
+        "CONFIG_PREEMPT_VOLUNTARY",
+        "CONFIG_PREEMPT_NONE",
+        "CONFIG_PREEMPT_LAZY",
+        "CONFIG_RCU_POSIX",
+        "CONFIG_RCU_EXPERT",
+        "CONFIG_RCU_STALL_COMMON",
+
+        // --- Kernel Config / Ikconfig ---
+        "CONFIG_IKCONFIG",
+        "CONFIG_IKCONFIG_PROC",
+        "CONFIG_IKHEADERS",
+        "CONFIG_KALLSYMS",
+        "CONFIG_KALLSYMS_ALL",
+        "CONFIG_KALLSYMS_ABSOLUTE_PERCPU",
+        "CONFIG_KALLSYMS_BASE_RELATIVE",
+        "CONFIG_MODULE_UNLOAD",
+        "CONFIG_MODVERSIONS",
+        "CONFIG_MODPROBE_PATH",
+        "CONFIG_KPROBES",
+        "CONFIG_UPROBES",
+        "CONFIG_EBPF",
+        "CONFIG_BPF",
+        "CONFIG_BPF_SYSCALL",
+        "CONFIG_BPF_JIT",
+        "CONFIG_BPF_L3_MPORT",
+        "CONFIG_BPF_STREAM_PARSER",
+        "CONFIG_BPFILTER",
+        "CONFIG_BPF_EVENTS",
+        "CONFIG_TRACING",
+        "CONFIG_TRACEPOINTS",
+        "CONFIG_FTRACE",
+        "CONFIG_FUNCTION_TRACER",
+        "CONFIG_FUNCTION_GRAPH_TRACER",
+        "CONFIG_STACKTRACE",
+        "CONFIG_DEBUG_FS",
+        "CONFIG_SLUB_DEBUG",
+        "CONFIG_RT_MUTEXES",
+        "CONFIG_BLK_DEV_INITRD",
+        "CONFIG_INITRAMFS_SOURCE",
+        "CONFIG_RCU_TRACE",
+        "CONFIG_SPARSE_IRQ",
+        "CONFIG_LOCKDEP",
+        "CONFIG_DEBUG_LOCK_ALLOC",
+        "CONFIG_PROVE_LOCKING",
+        "CONFIG_LOCKDEP_STALL",
+        "CONFIG_RCU_NOCB_CPU",
+        "CONFIG_HOTPLUG_CPU",
+        "CONFIG_PM",
+        "CONFIG_PM_SLEEP",
+        "CONFIG_SUSPEND",
+        "CONFIG_HIBERNATION",
+        "CONFIG_PM_RUNTIME",
+        "CONFIG_SCHED_DEBUG",
+        "CONFIG_SCHEDSTATS",
+        "CONFIG_DEBUG_PREEMPT",
+        "CONFIG_DEBUG_VM",
+        "CONFIG_DEBUG_VM_IRQSOFF",
+        "CONFIG_DEBUG_PAGEALLOC",
+        "CONFIG_SCHED_STACK_END_CHECK",
+        "CONFIG_PANIC_ON_OOPS",
+        "CONFIG_PANIC_ON_OOPS_WARN",
+        "CONFIG_PANIC_TIMEOUT",
+        "CONFIG_BUG",
+        "CONFIG_ELF_CORE",
+        "CONFIG_COREDUMP",
+        "CONFIG_PCSPKR_PLATFORM",
+        "CONFIG_PRINTK",
+        "CONFIG_PRINTK_TIME",
+        "CONFIG_PRINTK_SAFE",
+        "CONFIG_DYNAMIC_DEBUG",
+
+        // --- Memory Management ---
+        "CONFIG_SPARSEMEM",
+        "CONFIG_SPARSEMEM_VMEMMAP",
+        "CONFIG_HUGETLB_PAGE",
+        "CONFIG_TRANSPARENT_HUGEPAGE",
+        "CONFIG_TRANSPARENT_HUGEPAGE_MADVISE",
+        "CONFIG_MMAP_ALLOW_DUPLICATE",
+        "CONFIG_MADVISE",
+        "CONFIG_MERGE_EBPF_SEGMENTS",
+        "CONFIG_PAGECACHE",
+        "CONFIG_WB_RAMFS",
+        "CONFIG_CLEANCACHE",
+        "CONFIG_FRONTSWAP",
+        "CONFIG_KSM",
+        "CONFIG_DEFAULT_MMAP_MIN_ADDR",
+        "CONFIG_ARCH_SPARSEMEM_ENABLE",
+        "CONFIG_ZSMALLOC",
+        "CONFIG_ZBUD",
+        "CONFIG_ZSWAP",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_LZO",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_LZ4",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_LZ4HC",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_ZSTD",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_ZLATE",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_IZSTD",
+        "CONFIG_ZSWAP_COMPRESSOR_DEFAULT_ZSTD",
+        "CONFIG_ZSMALLOC_STAT",
+        "CONFIG_PAGE_ALLOC_COSTLY",
+        "CONFIG_COMPACTION",
+        "CONFIG_MIGRATION",
+        "CONFIG_MEMORY_FAILURE",
+        "CONFIG_MEMORY_HOTPLUG",
+        "CONFIG_MEMORY_HOTREMOVE",
+        "CONFIG_BALLOON_COMPACTION",
+        "CONFIG_SHMEM",
+        "CONFIG_TMPFS_XATTR",
+        "CONFIG_TMPFS_POSIX_ACL",
+        "CONFIG_TMPFS_POSIX_ACL",
+        "CONFIG_MEMFD_CREATE",
+        "CONFIG_KFENCE",
+        "CONFIG_KFENCE_SAMPLE_PERCENT",
+
+        // --- DMA / IOMMU ---
+        "CONFIG_HAS_IOMEM",
+        "CONFIG_HAS_IOPORT",
+        "CONFIG_HAS_DMA",
+        "CONFIG_DMA_CMA",
+        "CONFIG_CMA_AREAS",
+        "CONFIG_SWIOTLB",
+        "CONFIG_IOMMU_DMA",
+        "CONFIG_IOMMU_API",
+        "CONFIG_IOMMU_SUPPORT",
+        "CONFIG_ARM_SMMU",
+        "CONFIG_ARM_SMMU_V3",
+        "CONFIG_AMD_IOMMU",
+        "CONFIG_INTEL_IOMMU",
+        "CONFIG_DMABUF",
+        "CONFIG_DMABUF_MOVE_NOTIFY",
+        "CONFIG_DMABUF_SYSFS_SYNC_FILE",
+        "CONFIG_ION",
+        "CONFIG_ANDROID_ION",
+
+        // --- Filesystem ---
+        "CONFIG_EXT2_FS",
+        "CONFIG_EXT3_FS",
+        "CONFIG_EXT4_FS",
+        "CONFIG_EXT4_FS_POSIX_ACL",
+        "CONFIG_EXT4_FS_SECURITY",
+        "CONFIG_EXT4_FS_ENCRYPTION",
+        "CONFIG_EXT4_FS_POSIX_ACL",
+        "CONFIG_MSDOS_FS",
+        "CONFIG_FAT_FS",
+        "CONFIG_MSDOS_FS",
+        "CONFIG_VFAT_FS",
+        "CONFIG_FAT_DEFAULT_UTF8",
+        "CONFIG_THIN_PROC_FDT",
+        "CONFIG_F2FS_FS",
+        "CONFIG_F2FS_FS_COMPRESSION",
+        "CONFIG_F2FS_FS_COMPRESSION_ZSTD",
+        "CONFIG_F2FS_FS_COMPRESSION_LZ4",
+        "CONFIG_F2FS_FS_COMPRESSION_LZO",
+        "CONFIG_F2FS_FS_OLPC",
+        "CONFIG_F2FS_FS_LFS",
+        "CONFIG_F2FS_FS_CHECKPOINT_SEGMENT",
+        "CONFIG_F2FS_IO_TRACE",
+        "CONFIG_F2FS_FS_COMPRESSION_TRACE",
+        "CONFIG_F2FS_FS_SIT_BITMAP",
+        "CONFIG_F2FS_FS_COMPRESSION_PERSISTENT",
+        "CONFIG_F2FS_FS_COMPRESSION_SUPPORT",
+        "CONFIG_F2FS_FS_PROJECT",
+        "CONFIG_F2FS_FS_CHATTR",
+        "CONFIG_F2FS_FS_XATTR",
+        "CONFIG_F2FS_FS_COMPRESSION",
+        "CONFIG_F2FS_FS_COMPRESSION_TRACE",
+        "CONFIG_F2FS_FS_PROJECT",
+        "CONFIG_F2FS_FS_XATTR",
+        "CONFIG_F2FS_FS_CHATTR",
+        "CONFIG_F2FS_FS_USER_DROP",
+        "CONFIG_F2FS_FS_LAZYWRITE",
+        "CONFIG_F2FS_FS_SECURITY",
+        "CONFIG_F2FS_FS_ENCRYPTION",
+        "CONFIG_F2FS_FS_COMPRESSION_PERSISTENT",
+        "CONFIG_F2FS_FS_SIT_BITMAP",
+        "CONFIG_F2FS_FS_COMPRESSION",
+        "CONFIG_XFS_FS",
+        "CONFIG_XFS_SUPPORT_V4",
+        "CONFIG_XFS_RT",
+        "CONFIG_XFS_QUOTA",
+        "CONFIG_XFS_POSIX_ACL",
+        "CONFIG_XFS_LOG_REPLAY",
+        "CONFIG_XFS_ONLINE_SCRUB",
+        "CONFIG_XFS_DMAPI",
+        "CONFIG_XFS_CORRUPTION",
+        "CONFIG_XFS_PROC_FS",
+        "CONFIG_BTRFS_FS",
+        "CONFIG_BTRFS_FS_POSIX_ACL",
+        "CONFIG_BTRFS_FS_CHECK_INTEGRITY",
+        "CONFIG_BTRFS_FS_RUN_SANITY_TESTS",
+        "CONFIG_BTRFS_FS_COMPRESS",
+        "CONFIG_BTRFS_FS_COMPRESS_ZSTD",
+        "CONFIG_BTRFS_FS_COMPRESS_LZO",
+        "CONFIG_BTRFS_FS_COMPRESS_LZ4",
+        "CONFIG_BTRFS_FS_COMPRESS_ZLIB",
+        "CONFIG_BTRFS_FS_ENCRYPTION",
+        "CONFIG_BTRFS_DEBUG",
+        "CONFIG_BTRFS_ASSERT",
+        "CONFIG_BTRFS_DEBUG_FS",
+        "CONFIG_BTRFS_FS_ACL",
+        "CONFIG_BTRFS_FS_REF_VERIFY",
+        "CONFIG_BTRFS_FS_FORCE_RO",
+        "CONFIG_BTRFS_FS_ENCRYPTION",
+        "CONFIG_BTRFS_FS_ZSTD",
+        "CONFIG_BTRFS_FS_LZO",
+        "CONFIG_BTRFS_FS_ZLIB",
+        "CONFIG_BTRFS_FS_SNAPSHOT",
+        "CONFIG_NETWORK_FILESYSTEMS",
+        "CONFIG_NFS_FS",
+        "CONFIG_NFS_V3",
+        "CONFIG_NFS_V4",
+        "CONFIG_NFS_V4_1",
+        "CONFIG_CIFS",
+        "CONFIG_CIFS_UPCALL",
+        "CONFIG_CIFS_XATTR",
+        "CONFIG_CIFS_ACL",
+        "CONFIG_CIFS_SMBSIGN",
+        "CONFIG_CIFS_SMB_DIRECT",
+        "CONFIG_9P_FS",
+        "CONFIG_9P_FS_POSIX_ACL",
+        "CONFIG_MINIX_FS",
+        "CONFIG_EROFS_FS",
+        "CONFIG_EROFS_FS_COMPRESSION",
+        "CONFIG_EROFS_FS_PAGE_CACHE_VALIDATION",
+        "CONFIG_EROFS_FS_XATTR",
+        "CONFIG_EROFS_FS_POSIX_ACL",
+        "CONFIG_EROFS_FS_ENCRYPTION",
+        "CONFIG_CONFIGFS_FS",
+        "CONFIG_UBIFS_FS",
+        "CONFIG_UBIFS_FS_ADVANCED_COMPRESSION",
+        "CONFIG_UBIFS_FS_LZO",
+        "CONFIG_UBIFS_FS_ZLIB",
+        "CONFIG_UBIFS_FS_ZSTD",
+        "CONFIG_SQUASHFS",
+        "CONFIG_SQUASHFS_FILE_DIRECT",
+        "CONFIG_SQUASHFS_ZLIB",
+        "CONFIG_SQUASHFS_LZ4",
+        "CONFIG_SQUASHFS_LZO",
+        "CONFIG_SQUASHFS_XZ",
+        "CONFIG_SQUASHFS_ZSTD",
+        "CONFIG_SQUASHFS_FRAG_CACHE",
+        "CONFIG_NILFS2_FS",
+        "CONFIG_JFFS2_FS",
+        "CONFIG_JFFS2_FS_DEBUG",
+        "CONFIG_JFFS2_FS_WRITEBUFFER",
+        "CONFIG_JFFS2_FS_XATTR",
+        "CONFIG_JFFS2_COMPRESSION_OPTIONS",
+        "CONFIG_JFFS2_COMPRESSION_ZLIB",
+        "CONFIG_JFFS2_COMPRESSION_LZMA",
+        "CONFIG_CRAMFS",
+        "CONFIG_AUTOFS_FS",
+        "CONFIG_AUTOFS4_FS",
+        "CONFIG_FUSE_FS",
+        "CONFIG_OVERLAY_FS",
+        "CONFIG_OVERLAY_FS_REDIRECT_DIR",
+        "CONFIG_OVERLAY_FS_REDIRECT_ALWAYS_FOLLOW",
+        "CONFIG_OVERLAY_FS_INDEX",
+        "CONFIG_OVERLAY_FS_XATTR",
+        "CONFIG_OVERLAY_FS_POSIX_ACL",
+        "CONFIG_OVERLAY_FS_SUPER_MAGIC",
+        "CONFIG_NLS",
+        "CONFIG_NLS_UTF8",
+
+        // --- Network ---
+        "CONFIG_NET",
+        "CONFIG_NETDEVICES",
+        "CONFIG_NET_CORE",
+        "CONFIG_NET_SCHED",
+        "CONFIG_NET_SCH_FIFO",
+        "CONFIG_NET_SCH_HTB",
+        "CONFIG_NET_SCH_HFSC",
+        "CONFIG_NET_SCH_TBF",
+        "CONFIG_NET_SCH_FQ",
+        "CONFIG_NET_SCH fq_codel",
+        "CONFIG_NET_SCH_FQ_PIE",
+        "CONFIG_NET_SCH_INGRESS",
+        "CONFIG_NET_CLS",
+        "CONFIG_NET_CLS_ACT",
+        "CONFIG_NET_CLS_BPF",
+        "CONFIG_NET_CLS_U32",
+        "CONFIG_NET_CLS_RSVP",
+        "CONFIG_NET_ACT_POLICE",
+        "CONFIG_NET_ACT_GACT",
+        "CONFIG_NET_ACT_MIRRED",
+        "CONFIG_NET_ACT_SKBEDIT",
+        "CONFIG_NET_ACT_ACT_ON",
+        "CONFIG_NET_ACT_VLAN",
+        "CONFIG_NET_ACT_BPF",
+        "CONFIG_NET_SWITCHDEV",
+        "CONFIG_NET_DSA",
+        "CONFIG_NET_DSA_MV88E6XXX",
+        "CONFIG_NETFILTER",
+        "CONFIG_NETFILTER_ADVANCED",
+        "CONFIG_NETFILTER_XTABLES",
+        "CONFIG_NETFILTER_XT_TARGET_CLASSIFY",
+        "CONFIG_NETFILTER_XT_TARGET_CONNMARK",
+        "CONFIG_NETFILTER_XT_TARGET_CONNSECMARK",
+        "CONFIG_NETFILTER_XT_TARGET_IDLETIMER",
+        "CONFIG_NETFILTER_XT_TARGET_MARK",
+        "CONFIG_NETFILTER_XT_TARGET_NFLOG",
+        "CONFIG_NETFILTER_XT_TARGET_NFQUEUE",
+        "CONFIG_NETFILTER_XT_TARGET_SECMARK",
+        "CONFIG_NETFILTER_XT_TARGET_TCPMSS",
+        "CONFIG_NETFILTER_XT_TARGET_TPROXY",
+        "CONFIG_NETFILTER_XT_TARGET_TRACE",
+        "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE",
+        "CONFIG_NETFILTER_XT_MATCH_COMMENT",
+        "CONFIG_NETFILTER_XT_MATCH_CONNBYTES",
+        "CONFIG_NETFILTER_XT_MATCH_CONNLIMIT",
+        "CONFIG_NETFILTER_XT_MATCH_CONNMARK",
+        "CONFIG_NETFILTER_XT_MATCH_CONNTRACK",
+        "CONFIG_NETFILTER_XT_MATCH_HASHLIMIT",
+        "CONFIG_NETFILTER_XT_MATCH_HELPER",
+        "CONFIG_NETFILTER_XT_MATCH_LENGTH",
+        "CONFIG_NETFILTER_XT_MATCH_LIMIT",
+        "CONFIG_NETFILTER_XT_MATCH_MAC",
+        "CONFIG_NETFILTER_XT_MATCH_MARK",
+        "CONFIG_NETFILTER_XT_MATCH_MULTIPORT",
+        "CONFIG_NETFILTER_XT_MATCH_OWNER",
+        "CONFIG_NETFILTER_XT_MATCH_POLICY",
+        "CONFIG_NETFILTER_XT_MATCH_PKTTYPE",
+        "CONFIG_NETFILTER_XT_MATCH_QUOTA",
+        "CONFIG_NETFILTER_XT_MATCH_RATE",
+        "CONFIG_NETFILTER_XT_MATCH_SOCKET",
+        "CONFIG_NETFILTER_XT_MATCH_STATE",
+        "CONFIG_NETFILTER_XT_MATCH_STATISTIC",
+        "CONFIG_NETFILTER_XT_MATCH_STRING",
+        "CONFIG_NETFILTER_XT_MATCH_TIME",
+        "CONFIG_NETFILTER_XT_MATCH_TRACE",
+        "CONFIG_IPV6",
+        "CONFIG_INET",
+        "CONFIG_IP_MULTICAST",
+        "CONFIG_IP_PNP",
+        "CONFIG_IP_PNP_DHCP",
+        "CONFIG_IP_PNP_BOOTP",
+        "CONFIG_IP_PNP_RARP",
+        "CONFIG_IP_ROUTE",
+        "CONFIG_IP_ROUTE_MULTIPATH",
+        "CONFIG_IP_ROUTE_VERBOSE",
+        "CONFIG_IP_ROUTE_CLASSID",
+        "CONFIG_IP_ROUTE_FWMARK",
+        "CONFIG_TCP_CONG_CUBIC",
+        "CONFIG_TCP_CONG_BBR",
+        "CONFIG_TCP_CONG_BIC",
+        "CONFIG_TCP_CONG_WESTWOOD",
+        "CONFIG_TCP_CONG_HTSO",
+        "CONFIG_INET_AH",
+        "CONFIG_INET_ESP",
+        "CONFIG_INET_IPCOMP",
+        "CONFIG_INET_XFRM_MODE_TUNNEL",
+        "CONFIG_INET_XFRM_MODE_BEET",
+        "CONFIG_INET_XFRM_MODE_ROUTEOPTIMIZATION",
+        "CONFIG_IPV6_IPV6_TUNNEL",
+        "CONFIG_IPV6_MULTIPLE_TABLES",
+        "CONFIG_IPV6_SUBTREES",
+        "CONFIG_IPV6_MIP6",
+        "CONFIG_IPV6_VTI",
+        "CONFIG_IPV6_GRE",
+        "CONFIG_IPV6_MROUTE",
+        "CONFIG_IPV6_PIMSM_V2",
+        "CONFIG_IPV6_SEG6_L3_ENCAP",
+        "CONFIG_IPV6_SEG6_HMAC",
+        "CONFIG_RPS",
+        "CONFIG_RFS_ACCEL",
+        "CONFIG_XPS",
+        "CONFIG_CGROUP_NET_CLASSID",
+        "CONFIG_CGROUP_NET_PRIORIZE",
+        "CONFIG_BPF_SYSCALL",
+        "CONFIG_BPF_JIT",
+        "CONFIG_VLAN_8021Q",
+        "CONFIG_BRIDGE",
+        "CONFIG_BRIDGE_VLAN_FILTERING",
+        "CONFIG_VETH",
+        "CONFIG_MACVLAN",
+        "CONFIG_MACVTAP",
+        "CONFIG_IPVLAN",
+        "CONFIG_VXLAN",
+        "CONFIG_GENEVE",
+        "CONFIG_GRE",
+        "CONFIG_IP_GRE",
+        "CONFIG_IP_GRE_BROADCAST",
+        "CONFIG_IP_GRE_FCOE",
+        "CONFIG_IP_MROUTE",
+        "CONFIG_IP_MROUTE_MULTIPLE_TABLES",
+        "CONFIG_IP_PIMSM_V1",
+        "CONFIG_IP_PIMSM_V2",
+        "CONFIG_IP_ROUTE_NHT",
+        "CONFIG_IP_FIB_TRIE_STATS",
+        "CONFIG_INET_DIAG",
+        "CONFIG_INET_TCP_DIAG",
+        "CONFIG_INET_UDP_DIAG",
+        "CONFIG_INET_MPTCP_DIAG",
+        "CONFIG_INET_ESP",
+        "CONFIG_INET_LRO",
+        "CONFIG_INET_DIAG_DESTROY",
+        "CONFIG_TCP_MD5SIG",
+        "CONFIG_UDP_TUNNEL",
+        "CONFIG_NF_CONNTRACK",
+        "CONFIG_NF_TABLES",
+        "CONFIG_NF_NAT",
+        "CONFIG_NF_SOCKET_IPV4",
+        "CONFIG_NF_SOCKET_IPV6",
+        "CONFIG_NF_LOG_ARP",
+        "CONFIG_NF_LOG_IPV4",
+        "CONFIG_NF_LOG_IPV6",
+        "CONFIG_NF_REJECT_IPV4",
+        "CONFIG_NF_REJECT_IPV6",
+        "CONFIG_NF_CONNTRACK_AMANDA",
+        "CONFIG_NF_CONNTRACK_FTP",
+        "CONFIG_NF_CONNTRACK_H323",
+        "CONFIG_NF_CONNTRACK_IRC",
+        "CONFIG_NF_CONNTRACK_NETLINK",
+        "CONFIG_NF_CONNTRACK_SANE",
+        "CONFIG_NF_CONNTRACK_SIP",
+        "CONFIG_NF_CONNTRACK_SNMP",
+        "CONFIG_NF_CONNTRACK_TFTP",
+        "CONFIG_NF_CT_NETLINK",
+        "CONFIG_NF_CT_NETLINK_TIMEOUT",
+        "CONFIG_NF_CT_NETLINK_HELPER",
+        "CONFIG_NF_TABLES_INET",
+        "CONFIG_NF_TABLES_NETDEV",
+        "CONFIG_NFT_NUMGEN",
+        "CONFIG_NFT_CT",
+        "CONFIG_NFT_HASH",
+        "CONFIG_NFT_FIB",
+        "CONFIG_NFT_REJECT",
+        "CONFIG_NFT_DUP_IPV4",
+        "CONFIG_NFT_DUP_IPV6",
+        "CONFIG_NFT_FWD_IPV4",
+        "CONFIG_NFT_FWD_IPV6",
+        "CONFIG_NFT_DUP_NETDEV",
+        "CONFIG_NFT_FWD_NETDEV",
+        "CONFIG_NFT_QUEUE",
+        "CONFIG_NFT_QUOTA",
+        "CONFIG_NFT_REDIR",
+        "CONFIG_NFT_OBJREF",
+        "CONFIG_NFT_LOG",
+        "CONFIG_NFT_LIMIT",
+        "CONFIG_NFT_MSG",
+        "CONFIG_NFT_GOTO",
+        "CONFIG_NFT_IMMEDIATE",
+        "CONFIG_NFT_BITMAP",
+        "CONFIG_NFT_COUNTER",
+        "CONFIG_NFT_CONNLIMIT",
+        "CONFIG_NFT_COMPAT",
+        "CONFIG_NFT_META",
+        "CONFIG_NFT_BYTES",
+        "CONFIG_NFT_PKTTYPE",
+        "CONFIG_NFT_CHAIN_ROUTE_IPV4",
+        "CONFIG_NFT_CHAIN_ROUTE_IPV6",
+        "CONFIG_NFT_CHAIN_NAT_IPV4",
+        "CONFIG_NFT_CHAIN_NAT_IPV6",
+        "CONFIG_NFT_MASQ",
+        "CONFIG_NFT_REDIR_IPV4",
+        "CONFIG_NFT_REDIR_IPV6",
+        "CONFIG_NFT_REJECT_IPV4",
+        "CONFIG_NFT_REJECT_IPV6",
+        "CONFIG_NFT_CT_HELPER",
+        "CONFIG_NFT_SYNPROXY",
+        "CONFIG_NFT_FIB_INET",
+        "CONFIG_NFT_FIB_IPV4",
+        "CONFIG_NFT_FIB_IPV6",
+        "CONFIG_NFT_FIB_NETDEV",
+        "CONFIG_NFT_EXTHDR",
+        "CONFIG_NFT_SOCKET",
+        "CONFIG_NFT_OSB",
+        "CONFIG_NFT_TPROXY",
+        "CONFIG_NFT_CMP",
+        "CONFIG_NFT_JIT",
+        "CONFIG_NFT_COMPAT",
+        "CONFIG_NFT_HASH",
+        "CONFIG_NFT_NUMGEN",
+        "CONFIG_NFT_DYNSET",
+        "CONFIG_NFT_SET_BITMAP",
+        "CONFIG_NFT_RANGE",
+        "CONFIG_NFT_QUOTA",
+        "CONFIG_NFT_REJECT",
+        "CONFIG_NFT_DUP_IPV4",
+        "CONFIG_NFT_DUP_IPV6",
+        "CONFIG_NFT_DUP_NETDEV",
+        "CONFIG_NFT_FWD_IPV4",
+        "CONFIG_NFT_FWD_IPV6",
+        "CONFIG_NFT_FWD_NETDEV",
+        "CONFIG_NFT_QUEUE",
+        "CONFIG_NFT_NAT",
+        "CONFIG_NFT_COUNTER",
+        "CONFIG_NFT_LOG",
+        "CONFIG_NFT_LIMIT",
+        "CONFIG_NFT_CT",
+        "CONFIG_NFT_SET_HASH",
+        "CONFIG_NFT_SET_RBTREE",
+        "CONFIG_NFT_SET_BITMAP",
+        "CONFIG_NFT_SET_INTERVAL",
+        "CONFIG_NFT_SET_TIMEOUT",
+        "CONFIG_NFT_GOTO",
+        "CONFIG_NFT_NAT",
+        "CONFIG_NFT_REDIR",
+        "CONFIG_NFT_COMMIT",
+        "CONFIG_NFT_JIT",
+        "CONFIG_NET_RX_BUSY_POLL",
+        "CONFIG_BQL",
+        "CONFIG_NETFILTER_XT_MATCH_DCCP",
+        "CONFIG_NETFILTER_XT_MATCH_SCTP",
+        "CONFIG_NETFILTER_XT_MATCH_U32",
+
+        // --- Block / Storage ---
+        "CONFIG_BLOCK",
+        "CONFIG_BLK_DEV_SD",
+        "CONFIG_BLK_DEV_BSGLIB",
+        "CONFIG_BLK_DEV_INTEGRITY",
+        "CONFIG_BLK_DEV_DM",
+        "CONFIG_DM_CRYPT",
+        "CONFIG_DM_SNAPSHOT",
+        "CONFIG_DM_THIN_PROVISIONING",
+        "CONFIG_DM_CACHE",
+        "CONFIG_DM_MIRROR",
+        "CONFIG_DM_RAID",
+        "CONFIG_DM_ZERO",
+        "CONFIG_DM_MULTIPATH",
+        "CONFIG_DM_MULTIPATH_TB",
+        "CONFIG_DM_DELAY",
+        "CONFIG_DM_UEVENT",
+        "CONFIG_DM_FLAKEY",
+        "CONFIG_DM_BUFIO",
+        "CONFIG_DM_BUILTIN_DMATTRS",
+        "CONFIG_BLK_DEV_LOOP",
+        "CONFIG_BLK_DEV_RAM",
+        "CONFIG_BLK_DEV_RAM_SIZE",
+        "CONFIG_BLK_DEV_RBD",
+        "CONFIG_BLK_DEV_NVME",
+        "CONFIG_NVME_MULTIPATH",
+        "CONFIG_NVME_FC",
+        "CONFIG_NVME_TCP",
+        "CONFIG_BLK_DEV_NBD",
+        "CONFIG_SCSI",
+        "CONFIG_SCSI_DMA",
+        "CONFIG_SCSI_NETLINK",
+        "CONFIG_SCSI_MPT3SAS",
+        "CONFIG_SCSI_LPFC",
+        "CONFIG_SCSI_BNX2FC",
+        "CONFIG_SCSI_CXGB4_ISCSI",
+        "CONFIG_SCSI_MVSAS",
+        "CONFIG_SCSI_AIC94XX",
+        "CONFIG_SCSI_LIBFC",
+        "CONFIG_SCSI_LOWLEVEL",
+        "CONFIG_SCSI_DH",
+        "CONFIG_SCSI_DH_RDAC",
+        "CONFIG_SCSI_DH_ALUA",
+        "CONFIG_SCSI_HPSA",
+        "CONFIG_SCSI_QLA_ISCSI",
+        "CONFIG_TARGET_CORE",
+        "CONFIG_CONFIGFS_FS",
+        "CONFIG_SCSI_UFSHCD",
+        "CONFIG_SCSI_UFSHCD_PLATFORM",
+        "CONFIG_SCSI_UFSHCD_PCI",
+        "CONFIG_SCSI_UFS_BSG",
+        "CONFIG_SCSI_SMC_XGENE",
+        "CONFIG_SDIO_UART",
+        "CONFIG_MD",
+        "CONFIG_BLK_DEV_MD",
+        "CONFIG_MD_LINEAR",
+        "CONFIG_MD_RAID0",
+        "CONFIG_MD_RAID1",
+        "CONFIG_MD_RAID10",
+        "CONFIG_MD_RAID456",
+        "CONFIG_DM_CRYPT",
+        "CONFIG_BLK_INLINE_ENCRYPTION",
+        "CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK",
+        "CONFIG_BLK_DEV_ZONED",
+        "CONFIG_BLK_DEV_THROTTLING",
+        "CONFIG_BLK_WBT",
+        "CONFIG_BLK_WBT_MQ",
+        "CONFIG_BLK_CGROUP",
+        "CONFIG_DEBUG_BLK_CGROUP",
+        "CONFIG_IOSCHED_CFQ",
+        "CONFIG_IOSCHED_DEADLINE",
+        "CONFIG_IOSCHED_BFQ",
+
+        // --- Debug / Kernel hacking ---
+        "CONFIG_MAGIC_SYSRQ",
+        "CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE",
+        "CONFIG_DEBUG_KERNEL",
+        "CONFIG_DEBUG_KERNEL_CLEAR_CACHES",
+        "CONFIG_DEBUG_LIST",
+        "CONFIG_DEBUG_SG",
+        "CONFIG_DEBUG_NOTIFIERS",
+        "CONFIG_SCHED_DEBUG",
+        "CONFIG_SCHEDSTATS",
+        "CONFIG_TIMERSTATS",
+        "CONFIG_DEBUG_WQ_FORCE_RR_CPU",
+        "CONFIG_PROVE_RCU",
+        "CONFIG_PROVE_RCU_REPEATEDLY",
+        "CONFIG_RCU_STALL_COMMON",
+        "CONFIG_RCU_TRACE",
+        "CONFIG_RCU_EQS_DEBUG",
+        "CONFIG_DEBUG_RT_MUTEXES",
+        "CONFIG_DEBUG_MUTEXES",
+        "CONFIG_DEBUG_LOCK_ALLOC",
+        "CONFIG_LOCKDEP",
+        "CONFIG_PROVE_LOCKING",
+        "CONFIG_LOCK_STAT",
+        "CONFIG_DEBUG_SPINLOCK",
+        "CONFIG_DEBUG_MUTEXES",
+        "CONFIG_DEBUG_SPINLOCK_SLEEP",
+        "CONFIG_DEBUG_LOCKING_API_SELFTESTS",
+        "CONFIG_LOCKDEP_BITS",
+        "CONFIG_LOCKDEP_STACK_TRACE",
+        "CONFIG_LOCKDEP_COMPLETIONS",
+        "CONFIG_DEBUG_ATOMIC_SLEEP",
+        "CONFIG_DEBUG_VM",
+        "CONFIG_DEBUG_VM_IRQSOFF",
+        "CONFIG_DEBUG_VM_PGFLAGS",
+        "CONFIG_DEBUG_VIRTUAL",
+        "CONFIG_DEBUG_WRITECOUNT",
+        "CONFIG_DEBUG_MEMORY_INIT",
+        "CONFIG_DEBUG_STACK_USAGE",
+        "CONFIG_DEBUG_SHIRQ",
+        "CONFIG_DEBUG_PAGEALLOC",
+        "CONFIG_DEBUG_RODATA",
+        "CONFIG_DEBUG_RODATA_TEST",
+        "CONFIG_STRICT_KERNEL_RWX",
+        "CONFIG_STRICT_MODULE_RWX",
+        "CONFIG_DEBUG_TLBFLUSH",
+        "CONFIG_FRAME_POINTER",
+        "CONFIG_WERROR",
+        "CONFIG_STACKTRACE",
+        "CONFIG_BUG_ON_DATA_RACE",
+        "CONFIG_BPF_L3_MPORT",
+        "CONFIG_BPF_PRELOAD",
+        "CONFIG_BPF_PRELOAD_UGC",
+        "CONFIG_FORTIFY_SOURCE",
+        "CONFIG_FORTIFY_SOURCE_STRIP_FILENAMES",
+        "CONFIG_THREAD_INFO_IN_TASK",
+        "CONFIG_INIT_STACK_ALL_ZERO",
+        "CONFIG_INIT_STACK_ALL_PATTERN",
+        "CONFIG_ORC_UNWINDER",
+        "CONFIG_FRAME_POINTER",
+        "CONFIG_DEBUG_INFO",
+        "CONFIG_DEBUG_INFO_NONE",
+        "CONFIG_DEBUG_INFO_DWARF4",
+        "CONFIG_DEBUG_INFO_DWARF5",
+        "CONFIG_DEBUG_INFO_REDUCED",
+        "CONFIG_DEBUG_INFO_SPLIT",
+        "CONFIG_DEBUG_INFO_COMPRESSION",
+        "CONFIG_DEBUG_ICEDATA",
+        "CONFIG_KASAN",
+        "CONFIG_KASAN_GENERIC",
+        "CONFIG_KASAN_OUTLINE",
+        "CONFIG_KASAN_INLINE",
+        "CONFIG_KASAN_VMALLOC",
+        "CONFIG_KASAN_SW_TAGS",
+        "CONFIG_KCSAN",
+        "CONFIG_KCSAN_VERBOSE",
+        "CONFIG_KCSAN_INTERRUPT_WORK",
+        "CONFIG_KCOV",
+        "CONFIG_SBRB_REPORT_KCOV",
+        "CONFIG_SLABINFO",
+        "CONFIG_DEBUG_SLAB",
+        "CONFIG_DEBUG_SLAB_LEAK",
+        "CONFIG_LATENCYTOP",
+        "CONFIG_USER_STACKTRACE_SUPPORT",
+        "CONFIG_TRACING_SUPPORT",
+        "CONFIG_FTRACE",
+        "CONFIG_FUNCTION_TRACER",
+        "CONFIG_JUMP_LABEL",
+        "CONFIG_HAVE_FUNCTION_TRACER",
+        "CONFIG_HAVE_FUNCTION_GRAPH_TRACER",
+        "CONFIG_HAVE_DYNAMIC_FTRACE",
+        "CONFIG_HAVE_DYNAMIC_FTRACE_WITH_REGS",
+        "CONFIG_HAVE_FENTRY",
+        "CONFIG_HAVE_C_RECORDMCOUNT",
+        "CONFIG_MCOUNT_SYSCALL",
+        "CONFIG_RING_BUFFER",
+        "CONFIG_EVENT_TRACING",
+        "CONFIG_RING_BUFFER_ALLOW_SWAP",
+        "CONFIG_TRACING_EVENTS",
+        "CONFIG_CONTEXT_SWITCH_TRACER",
+        "CONFIG_PREEMPTIRQ_EVENTS",
+        "CONFIG_TRACING",
+        "CONFIG_GENERIC_TRACER",
+        "CONFIG_TRACING_SUPPORT",
+        "CONFIG_RING_BUFFER",
+        "CONFIG_BRANCH_PROFILE_FUNCTION",
+        "CONFIG_PROFILE_ALL_BRANCHES",
+        "CONFIG_DYNAMIC_FTRACE",
+        "CONFIG_DYNAMIC_FTRACE_WITH_REGS",
+        "CONFIG_FTRACE_MCOUNT_RECORD",
+        "CONFIG_EVENT_TRACING",
+        "CONFIG_TRACING_EVENTS",
+        "CONFIG_HIST_TRIGGERS",
+        "CONFIG_TRACING_MAP",
+        "CONFIG_TRACING_NET",
+        "CONFIG_BPF_EVENTS",
+        "CONFIG_TRACE_PRINTK",
+        "CONFIG_BPRINTK",
+        "CONFIG_PRINT_IP_KSYM",
+        "CONFIG_PRINT_CALLER",
+        "CONFIG_FTRACE_SYSCALLS",
+        "CONFIG_TRACER_MAX_TRACE",
+        "CONFIG_BRANCH tracER",
+        "CONFIG_PROVELOCKING",
+        "CONFIG_PANIC_ON_OOPS",
+        "CONFIG_PANIC_TIMEOUT",
+        "CONFIG_PANIC_ON_OOPS_WARN",
+        "CONFIG_GROUP_SCHED",
+        "CONFIG_CGROUPS",
+        "CONFIG_CGROUP_CPUACCT",
+        "CONFIG_CGROUP_PERF",
+        "CONFIG_CGROUP_BPF",
+        "CONFIG_CGROUP_FREEZER",
+        "CONFIG_CGROUP_HUGETLB",
+        "CONFIG_CPUSETS",
+        "CONFIG_CGROUP_PID",
+        "CONFIG_CGROUP_RT",
+        "CONFIG_CGROUP_SCHED",
+        "CONFIG_FAIR_GROUP_SCHED",
+        "CONFIG_CFS_BANDWIDTH",
+        "CONFIG_REALTIME_GROUPS",
+        "CONFIG_UCLAMP_TASK",
+        "CONFIG_UCLAMP_BUCKETS_COUNT",
+        "CONFIG_CGROUP_DEVICE",
+        "CONFIG_CGROUP_CPUACCT",
+        "CONFIG_CGROUP_MEM_RES_CTLR",
+        "CONFIG_MEMCG",
+        "CONFIG_MEMCG_SWAP",
+        "CONFIG_MEMCG_KMEM",
+        "CONFIG_CGROUP_RDMA",
+        "CONFIG_CGROUP_NET_CLASSID",
+        "CONFIG_CGROUP_NET_PRIORIZE",
+        "CONFIG_BLK_CGROUP",
+        "CONFIG_IOMMU_IO_PGTABLE_LPAE",
+        "CONFIG_IOMMU_IO_PGTABLE_ARMV7S",
+
+        // --- DRM / GPU ---
+        "CONFIG_DRM",
+        "CONFIG_DRM_KMS_HELPER",
+        "CONFIG_DRM_FBDEV_EMULATION",
+        "CONFIG_DRM_DEBUG_MM",
+        "CONFIG_DRM_PANEL",
+        "CONFIG_DRM_BRIDGE",
+        "CONFIG_DRM_PANEL_BRIDGE",
+        "CONFIG_DRM_SCHED",
+        "CONFIG_DRM_TTM",
+        "CONFIG_DRM_VRAM_HELPER",
+        "CONFIG_DRM_TTM_HELPER",
+        "CONFIG_DRM_GEM_HELPER",
+        "CONFIG_DRM_IOMMU",
+        "CONFIG_DRM_LOAD_EDID_FIRMWARE",
+        "CONFIG_DRM_DP_AUX_CHARDEV",
+        "CONFIG_DRM_DP_CEC",
+        "CONFIG_QCOM_DRM",
+        "CONFIG_DRM_MSM",
+        "CONFIG_MSM_DRM_HDMI",
+        "CONFIG_MSM_DRM_GPU",
+        "CONFIG_MSM_GPU_STATE",
+        "CONFIG_DRM_PANEL_ORIENTATION_QUIRKS",
+        "CONFIG_DRM_SIMPLE_BRIDGE",
+        "CONFIG_DRM_PANEL_SIMPLE",
+
+        // --- Watchdog ---
+        "CONFIG_WATCHDOG",
+        "CONFIG_WATCHDOG_CORE",
+        "CONFIG_WATCHDOG_NOWAYOUT",
+        "CONFIG_QCOM_WDT",
+        "CONFIG_ARM_SP805_WATCHDOG",
+        "CONFIG_ARMADA_37X_WDT",
+        "CONFIG_MFD_STM32_RTC",
+        "CONFIG_HW_WATCHDOG",
+        "CONFIG_MFD_STM32_TIMERS",
+        "CONFIG_QCOM_PDC",
+        "CONFIG_QCOM_APCS_IPC",
+        "CONFIG_QCOM_SMEM",
+        "CONFIG_QCOM_SMD",
+        "CONFIG_QCOM_SMSM",
+        "CONFIG_QCOM_RPMH",
+        "CONFIG_QCOM_LLCC",
+        "CONFIG_QCOM_CM3",
+
+        // --- I2C / SPI / Pinctrl ---
+        "CONFIG_I2C",
+        "CONFIG_I2C_CHARDEV",
+        "CONFIG_I2C_SLAVE",
+        "CONFIG_I2C_QCOM_CCI",
+        "CONFIG_I2C_HISI",
+        "CONFIG_SPI",
+        "CONFIG_SPI_MASTER",
+        "CONFIG_SPI_SLAVE",
+        "CONFIG_SPI_QUP",
+        "CONFIG_SPI_MEM",
+        "CONFIG_PINCTRL",
+        "CONFIG_PINCTRL_QCOM",
+        "CONFIG_Pinctrl_GENERIC",
+
+        // --- Misc (Power / Random / IRQ) ---
+        "CONFIG_IRQDOMAIN",
+        "CONFIG_IRQ_DOMAIN_HIERARCHY",
+        "CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK",
+        "CONFIG_GENERIC_MSI_IRQ",
+        "CONFIG_GENERIC_MSI_IRQ_DOMAIN",
+        "CONFIG_IRQ_FOR_DEVICE_DEPTH",
+        "CONFIG_GENERIC_IRQ_SHOW",
+        "CONFIG_GENERIC_IRQ_SHOW_LEVEL",
+        "CONFIG_GENERIC_PENDING_IRQ",
+        "CONFIG_HARDIRQS_SW_RESEND",
+        "CONFIG_IRQ_TIME_ACCOUNTING",
+        "CONFIG_GENERIC_CLOCKEVENTS",
+        "CONFIG_GENERIC_CLOCKEVENTS_BROADCAST",
+        "CONFIG_PM_CLOCK",
+        "CONFIG_CLKSRC_MMIO",
+        "CONFIG_ARCH_CLOCKSOURCE_DATA",
+        "CONFIG_CLKEVT_ONESHOT",
+        "CONFIG_TICK_ONESHOT",
+        "CONFIG_NO_HZ_FULL",
+        "CONFIG_NO_HZ_IDLE",
+        "CONFIG_NO_HZ_COMMON",
+        "CONFIG_HIGH_RES_TIMERS",
+        "CONFIG_PREEMPT_RCU",
+        "CONFIG_TINY_RCU",
+        "CONFIG_SRCU",
+        "CONFIG_TASKS_RCU_GENERIC",
+        "CONFIG_TASKS_TRACE_RCU",
+        "CONFIG_TASKS_RCU",
+        "CONFIG_TASKS_RUDE_RCU",
+        "CONFIG_TASKS_TRACE_RCU",
+        "CONFIG_TINY_SRCU",
+        "CONFIG_RCU_STALL_COMMON",
+        "CONFIG_RCU_NOCB_CPU",
+        "CONFIG_RCU_NOCB_CPU_ZERO",
+        "CONFIG_RCU_LAZY",
+        "CONFIG_CGROUP_PIDS",
+        "CONFIG_CGROUP_DFL",
+        "CONFIG_ELF_CORE",
+        "CONFIG_COREDUMP",
+        "CONFIG_CRASH_DUMP",
+        "CONFIG_PANIC_ON_OOPS",
+        "CONFIG_PANIC_ON_OOPS_PANIC_TIMEOUT",
+        "CONFIG_RELOCATABLE",
+        "CONFIG_RANDOMIZE_BASE",
+        "CONFIG_RANDOMIZE_MODULE_REGION_FULL",
+        "CONFIG_STRICT_KERNEL_RWX",
+        "CONFIG_STRICT_MODULE_RWX",
+        "CONFIG_DEBUG_CREDENTIALS",
+        "CONFIG_DEBUG_NOTIFIERS",
+        "CONFIG_SLAB_FREELIST_RANDOM",
+        "CONFIG_SLAB_FREELIST_HARDENED",
+        "CONFIG_SLUB_DEBUG_ON",
+        "CONFIG_SLUB_stats",
+        "CONFIG_SLUB_DEBUG_PANIC_ON",
+        "CONFIG_UBSAN",
+        "CONFIG_UBSAN_TRAP",
+        "CONFIG_UBSAN_SANITIZE_ALL",
+        "CONFIG_UBSAN_BOUNDS",
+        "CONFIG_UBSAN_SHIFT",
+        "CONFIG_UBSAN_SIGNED_WRAP",
+        "CONFIG_UBSAN_UNLOAD",
+        "CONFIG_LTO",
+        "CONFIG_LTO_CLANG",
+        "CONFIG_LTO_NONE",
+        "CONFIG_THINLTO",
+        "CONFIG_GCOV_KERNEL",
+        "CONFIG_CC_HAS_GCOV_INSTRUMENT_ALL",
+        "CONFIG_TEST_KMOD",
+        "CONFIG_TEST_FORCE_FAIL",
+        "CONFIG_TEST_PRINTF",
+        "CONFIG_TEST_OVERFLOW",
+        "CONFIG_TEST_RHASLIST",
+        "CONFIG_TEST_BITMAP",
+        "CONFIG_TEST_SORT",
+        "CONFIG_TEST_KSTRTOX",
+        "CONFIG_TEST_MIN_HEAP",
+        "CONFIG_TEST_LKM",
+        "CONFIG_TEST_LOCKUP",
+        "CONFIG_TEST_MUTEX",
+        "CONFIG_TEST_SUSPEND",
+        "CONFIG_TEST_STATIC_KEYS",
+        "CONFIG_TEST_FIRMWARE",
+        "CONFIG_TEST_STATIC_KEYS",
+        "CONFIG_TEST_BITFIELD",
+        "CONFIG_TEST_IDA",
+        "CONFIG_TEST_KASAN_MODULE",
+        "CONFIG_TEST_PRINTF",
+        "CONFIG_TEST_SSCMP",
+        "CONFIG_TEST_STRSCPY",
+        "CONFIG_TEST_BLACKHOLE_DEV",
+        "CONFIG_TEST_ASYNC_DISC_SIGNAL",
+        "CONFIG_TEST_SYSCTL",
+        "CONFIG_TEST_USER_COPY",
+        "CONFIG_TEST_BPF",
+        "CONFIG_DUMMY_TEST",
+        "CONFIG_TEST_MEMCAT_P",
+        "CONFIG_TEST_KMOD",
+        "CONFIG_TEST_HEXDUMP",
+        "CONFIG_STRING_SELFTEST",
+        "CONFIG_TEST_LLMATH",
+        "CONFIG_TEST_MEMCPY",
+        "CONFIG_TEST_MEMINIT",
+        "CONFIG_TEST_MEMSTART",
+        "CONFIG_TEST_PRINTF",
+        "CONFIG_TESTS",
+
+        // --- Android-specific ---
+        "CONFIG_ANDROID",
+        "CONFIG_ANDROID_BINDERFS",
+        "CONFIG_ANDROID_BINDER_DEVICES",
+        "CONFIG_ANDROID_BINDER_IPC",
+        "CONFIG_ANDROID_BINDER_IPC_SELFTEST",
+        "CONFIG_ANDROID_LOW_MEMORY_KILLER",
+        "CONFIG_PSTORE",
+        "CONFIG_PSTORE_COMPRESS",
+        "CONFIG_PSTORE_COMPRESS_DEFAULT_ZSTD",
+        "CONFIG_PSTORE_COMPRESS_DEFAULT_LZ4",
+        "CONFIG_PSTORE_COMPRESS_DEFAULT_LZO",
+        "CONFIG_PSTORE_COMPRESS_DEFAULT_ZLIB",
+        "CONFIG_PSTORE_DEFLATE_COMPRESS",
+        "CONFIG_PSTORE_LZ4_COMPRESS",
+        "CONFIG_PSTORE_LZO_COMPRESS",
+        "CONFIG_PSTORE_ZSTD_COMPRESS",
+        "CONFIG_PSTORE_RAM",
+        "CONFIG_PSTORE_CONSOLE",
+        "CONFIG_PSTORE_PMSG",
+        "CONFIG_PSTORE_FAT",
+        "CONFIG_PSTORE_NVRAM",
+        "CONFIG_ASHMEM",
+        "CONFIG_ANDROID_LOGGER",
+        "CONFIG_UID_STAT",
+        "CONFIG_QCOM_EBI2",
+        "CONFIG_QCOM_ICC_BWMON",
+        "CONFIG_QCOM_HMT",
+        "CONFIG_QCOM_PMICarb",
+        "CONFIG_QCOM_SMEM_STATE",
+        "CONFIG_QCOM_SMP2P",
+        "CONFIG_QCOM_WCNSS_CTRL",
+        "CONFIG_QCOM_AOSS_QMP",
+        "CONFIG_QCOM_GSBI",
+        "CONFIG_QCOM_LLCC",
+        "CONFIG_QCOM_PDC",
+        "CONFIG_QCOM_RPMPD",
+        "CONFIG_QCOM_SMSM",
+        "CONFIG_QCOM_SMD",
+        "CONFIG_QCOM_SMEM",
+        "CONFIG_QCOM_SPMI",
+        "CONFIG_QCOM_TZMEMPOOL",
+
+        // --- RT ---
+        "CONFIG_PREEMPT_RT",
+        "CONFIG_PREEMPT_COUNT",
+        "CONFIG_PREEMPT_NOTIFIERS",
+        "CONFIG_PREEMPTIRQ_DISABLED",
+        "CONFIG_PREEMPTIRQ_EVENTS",
+        "CONFIG_PREEMPTIRQ_TRACEPOINTS",
+        "CONFIG_PREEMPTIRQ_TRACEPOINTS",
+        "CONFIG_PREEMPTIRQ_EVENTS",
+        "CONFIG_PREEMPTIRQ_TRACEPOINTS",
+        "CONFIG_PREEMPT_COUNT",
+        "CONFIG_PREEMPT_NOTIFIERS",
+
+        // --- Security ---
+        "CONFIG_SECURITY",
+        "CONFIG_SECURITY_DMESG_RESTRICT",
+        "CONFIG_SECURITY_PATH",
+        "CONFIG_SECURITY_YAMA",
+        "CONFIG_SECURITY_LANDLOCK",
+        "CONFIG_SECURITY_SELINUX",
+        "CONFIG_SECURITY_APPARMOR",
+        "CONFIG_SECURITY_SMACK",
+        "CONFIG_SECURITY_TOMOYO",
+        "CONFIG_SECURITY_SMACK",
+        "CONFIG_SECURITY_ROOTPLUG",
+        "CONFIG_SECURITY_WATCHDOG",
+        "CONFIG_SECURITY_WRITABLE_HOOKS",
+        "CONFIG_SECURITY_PERF_EVENTS_RESTRICT",
+        "CONFIG_SECURITY_SELINUX",
+        "CONFIG_SECURITY_SECCOMP",
+        "CONFIG_SECURITY_YAMA",
+        "CONFIG_SECURITY_LOCKDOWN_LSM",
+        "CONFIG_LOCKDOWN",
+        "CONFIG_INTEGRITY",
+        "CONFIG_INTEGRITY_SIGNATURE",
+        "CONFIG_INTEGRITY_SIGNATURE",
+        "CONFIG_INTEGRITY_AUDIT",
+        "CONFIG_IMA",
+        "CONFIG_IMA_KEXEC",
+        "CONFIG_IMA_ASYM_METRICS",
+        "CONFIG_IMA_MEASURE_PCR_IDX",
+        "CONFIG_IPE",
+        "CONFIG_SECURITY_SAFESET",
+        "CONFIG_KEYS",
+        "CONFIG_ENCRYPTED_KEYS",
+        "CONFIG_KEY_DH_OPERATIONS",
+        "CONFIG_SECURITY_FS",
+        "CONFIG_SECURITY_FILE_CAPABILITIES",
+        "CONFIG_SECURITY_ROOTPLUG",
+        "CONFIG_SECURITY_YAMA",
+        "CONFIG_SECURITY_LANDLOCK",
+
+        // --- BPF / XDP ---
+        "CONFIG_BPF",
+        "CONFIG_BPF_SYSCALL",
+        "CONFIG_BPF_JIT",
+        "CONFIG_BPF_L3_MPORT",
+        "CONFIG_BPF_STREAM_PARSER",
+        "CONFIG_BPFILTER",
+        "CONFIG_BPF_EVENTS",
+        "CONFIG_BPF_PRELOAD",
+        "CONFIG_BPF_PRELOAD_UGC",
+        "CONFIG_BPF_L4X",
+        "CONFIG_XDP_SOCKETS",
+        "CONFIG_XDP_SOCKETS_DIAG",
+        "CONFIG_BPF_KPROBE_OVERRIDE",
+        "CONFIG_BPF_UNPRIV",
+        "CONFIG_BPF_LSM",
+        "CONFIG_CGROUP_BPF",
+        "CONFIG_BPF_KCORE_ELF",
+        "CONFIG_BPF_KPROBE_OVERRIDE",
+        "CONFIG_BPF_LSM",
+        "CONFIG_BPF_PRELOAD",
+        "CONFIG_BPF_SYSCALL",
+
+        // --- Debug / Tracing additions ---
+        "CONFIG_KPROBES",
+        "CONFIG_UPROBES",
+        "CONFIG_KRETPROBES",
+        "CONFIG_KPROBES_SANITY_TEST",
+        "CONFIG_UPROBE_SANITY_TEST",
+        "CONFIG_KPROBES_ON_FTRACE",
+        "CONFIG_HAVE_KPROBES",
+        "CONFIG_HAVE_KRETPROBES",
+        "CONFIG_HAVE_KPROBES_ON_FTRACE",
+        "CONFIG_KPROBES_EVENT",
+        "CONFIG_UPROBE_EVENTS",
+        "CONFIG_TRACING_EVENTS",
+
+        // --- ION / DMA Buffers ---
+        "CONFIG_ION",
+        "CONFIG_ION_TEST",
+        "CONFIG_ION_DEBUG",
+        "CONFIG_ION_CMA_HEAP",
+        "CONFIG_ION_SYSTEM_HEAP",
+        "CONFIG_ION_CARVEOUT_HEAP",
+        "CONFIG_ION_HEAP",
+        "CONFIG_ION_PAGE_OFFSET",
+
+        // --- CPUFreq / Thermal ---
+        "CONFIG_CPU_FREQ",
+        "CONFIG_CPU_FREQ_GOV_PERFORMANCE",
+        "CONFIG_CPU_FREQ_GOV_POWERSAVE",
+        "CONFIG_CPU_FREQ_GOV_USERSPACE",
+        "CONFIG_CPU_FREQ_GOV_ONDEMAND",
+        "CONFIG_CPU_FREQ_GOV_CONSERVATIVE",
+        "CONFIG_CPU_FREQ_GOV_SCHEDUTIL",
+        "CONFIG_CPUFreq_DT",
+        "CONFIG_QCOM_CPUFREQ",
+        "CONFIG_QCOM_ADRENO_CPUFREQ",
+        "CONFIG_THERMAL",
+        "CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE",
+        "CONFIG_THERMAL_EMERGENCY_POWEROFF_DELAY",
+        "CONFIG_THERMAL_HWMON",
+        "CONFIG_CPU_THERMAL",
+        "CONFIG_DEVTEMP",
+        "CONFIG_THERMAL_NETLINK",
+        "CONFIG_THERMAL_OF",
+        "CONFIG_QCOM_THERMADM",
+        "CONFIG_QCOM_SPMI_TEMP_AMPL",
+        "CONFIG_QCOM_TSENS",
+        "CONFIG_THERMAL_EMERGENCY_POWEROFF_DELAY",
+        "CONFIG_THERMAL_FW",
+        "CONFIG_THERMAL_GOV_STEP_WISE",
+        "CONFIG_THERMAL_GOV_BANG_BANG",
+        "CONFIG_THERMAL_GOV_USER_SPACE",
+        "CONFIG_THERMAL_STATISTICS",
+
+        // --- Additional common config ---
+        "CONFIG_ARCH_MSM",
+        "CONFIG_ARCH_KRAIT",
+        "CONFIG_ARCH_QCOM",
+        "CONFIG_ARCH_QCOM_SM8",
+        "CONFIG_ARCH_QCOM_SDM",
+        "CONFIG_ARCH_QCOM_APQ",
+        "CONFIG_ARCH_QCOM_SDA",
+        "CONFIG_ARCH_QCOM_SC",
+        "CONFIG_OF",
+        "CONFIG_OF_DYNAMIC",
+        "CONFIG_OF_OVERLAY",
+        "CONFIG_OF_EARLY_FLATTREE",
+        "CONFIG_OF_KOBJ",
+        "CONFIG_OF_ADDR_MAP",
+        "CONFIG_OF_MDIO",
+        "CONFIG_OF_MTD",
+        "CONFIG_OF_MDIO",
+        "CONFIG_OF_PROMTREE",
+        "CONFIG_OF_UNITTEST",
+        "CONFIG_OF_RESOLVE",
+        "CONFIG_OF_OVERLAY",
+        "CONFIG_OF_KOBJ",
+        "CONFIG_OF_NUMA",
+        "CONFIG_ACPI",
+        "CONFIG_OF_ADDRESS",
+        "CONFIG_OF_IRQ",
+        "CONFIG_OF_MSI",
+        "CONFIG_OF_RESERVED_MEM",
+        "CONFIG_OF_FLATTREE",
+        "CONFIG_OF_EPHEMERAL",
+        "CONFIG_FHANDLE",
+        "CONFIG_USELIB",
+        "CONFIG_HAVE_ARCH_SECCOMP_FILTER",
+        "CONFIG_SECCOMP",
+        "CONFIG_SECCOMP_FILTER",
+        "CONFIG_COMPAT",
+        "CONFIG_COMPAT_BRK",
+        "CONFIG_BINFMT_ELF",
+        "CONFIG_COREDUMP",
+        "CONFIG_BINFMT_SCRIPT",
+        "CONFIG_BINFMT_MISC",
+        "CONFIG_BINFMT_AOUT",
+        "CONFIG_BINFMT_ELF_RANDOMIZE_PIE",
+        "CONFIG_COMPAT_32BIT_TIME",
+        "CONFIG_ARCH_WANT_COMPAT_IPC_PARSE_VERSION",
+        "CONFIG_HAVE_ARCH_TRACEHOOK",
+        "CONFIG_HAVE_SETUP_SETUID_CONTEXT",
+        "CONFIG_HAVE_SYSCALL_TRACEPOINTS",
+        "CONFIG_HAVE_COPY_THREAD_TLS",
+        "CONFIG_VDSO",
+        "CONFIG_GENERIC_CALIBRATE_DELAY",
+        "CONFIG_ZONE_DMA",
+        "CONFIG_ZONE_DMA32",
+        "CONFIG_ARCH_USES_HIGH_VMA_FLAGS",
+        "CONFIG_ARCH_HAS_PTE_SPECIAL",
+        "CONFIG_ARCH_HAS_PTE_DEVMAP",
+        "CONFIG_ARCH_HAS_PTE_SWP_EXCLUSIVE",
+        "CONFIG_ARCH_HAS_HUGETLB_PINNED",
+        "CONFIG_STACKPROTECTOR",
+        "CONFIG_STACKPROTECTOR_STRONG",
+        "CONFIG_STACKPROTECTOR_PER_TASK",
+        "CONFIG_LTO",
+        "CONFIG_UNWINDER_ARM",
+        "CONFIG_UNWINDER_FRAME_POINTER",
+        "CONFIG_UNWINDER_ORC",
+        "CONFIG_BUILDTIME_EXTABLE_SORT",
+        "CONFIG_ARCH_HAS_SYNC_CORE_BEFORE_USERMODE",
+        "CONFIG_ARCH_REQ_CPCONF",
+        "CONFIG_ARCH_HAS_COHIERENT_PAGE",
+        "CONFIG_ARCH_HAS_SET_MEMORY",
+        "CONFIG_ARCH_HAS_SET_DIRECT_MAP",
+        "CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD",
+        "CONFIG_HAVE_ARCH_JUMP_LABEL",
+        "CONFIG_HAVE_ARCH_JUMP_LABEL_RELATIVE",
+        "CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG",
+        "CONFIG_HAVE_CMPXCHG_DOUBLE",
+        "CONFIG_HAVE_CMPXCHG_LOCAL",
+        "CONFIG_ARCH_WANT_GENERAL_HUGETLB",
+        "CONFIG_ARCH_WANT_COMPAT_IPC_PARSE_VERSION",
+        "CONFIG_ARCH_WANT_HTCATCH",
+        "CONFIG_AUDIT",
+        "CONFIG_AUDITSYSCALL",
+        "CONFIG_64BIT",
+        "CONFIG_MMU",
+        "CONFIG_NEED_DMA_MAP_STATE",
+        "CONFIG_HAVE_ARCH_PFN_VALID",
+        "CONFIG_ARCH_KEEP_MEMBLOCK",
+        "CONFIG_ARCH_HAS_PTE_SPECIAL",
+        "CONFIG_ARCH_HAS_PTE_DEVMAP",
+        "CONFIG_ARCH_HAS_GIGANTIC_PAGE",
+        "CONFIG_ARCH_HAS_HUGE_PMD_SWAP",
+        "CONFIG_ARCH_HAS_CURRENT_STACK_POINTER",
+        "CONFIG_ARCH_HAS_CURRENT_STACK_POINTER",
+        "CONFIG_ARCH_HAS_PARANOID_SRBAT_ASM",
+        "CONFIG_ARCH_SUPPORTS_EXSTACK_MONITOR",
+        "CONFIG_ARCH_SUPPORTS_INT128",
+        "CONFIG_ARCH_SUPPORTS_ATOMIC_RMW",
+        "CONFIG_ARCH_USES_HIGH_VMA_FLAGS",
+        "CONFIG_ARCH_HAS_READ_IMPLIES_EXEC",
+        "CONFIG_ARCH_STACKWALK",
+        "CONFIG_ARCH_WANTS_NO_INSTR",
+        "CONFIG_HAVE_ARCH_VMAP_STACK",
+        "CONFIG_VMAP_STACK",
+        "CONFIG_STACKPROTECTOR",
+        "CONFIG_STACKPROTECTOR_STRONG",
+        "CONFIG_SHADOW_CALL_STACK",
+        "CONFIG_CFI_CLANG",
+        "CONFIG_CFI_PERMISSIVE",
+        "CONFIG_CFI_CLANG_THIN",
+        "CONFIG_CFI_CLANG_THIN_CB",
+        "CONFIG_CONSTRUCTORS",
+        "CONFIG_CFI_CLANG_THIN_EXPORTS",
+        "CONFIG_FUNCTION_PADDING_SECTIONS",
+        "CONFIG_FUNCTION_PADDING_INSNS",
+        "CONFIG_FUNCTION_PADDING_BYTES",
+        "CONFIG_SECTION_MISMATCH_WARN_ONLY",
+        "CONFIG_HOTPLUG_CPU",
+        "CONFIG_CRASH_CORE",
+        "CONFIG_CRASH_DUMP",
+        "CONFIG_KEXEC_CORE",
+        "CONFIG_KEXEC",
+        "CONFIG_KEXEC_FILE",
+        "CONFIG_KEXEC_SIG",
+        "CONFIG_KEXEC_SIG_FORCE",
+        "CONFIG_KEXEC_VERIFY_SIG",
+        "CONFIG_CGROUP_SCHED",
+        "CONFIG_TASK_DELAY_ACCT",
+        "CONFIG_TASK_XACCT",
+        "CONFIG_TASK_IO_ACCOUNTING",
+        "CONFIG_IKHEADERS",
+        "CONFIG_IKCONFIG",
+        "CONFIG_IKCONFIG_PROC",
+        "CONFIG_UTS_NS",
+        "CONFIG_USER_NS",
+        "CONFIG_PID_NS",
+        "CONFIG_NET_NS",
+        "CONFIG_IPC_NS",
+        "CONFIG_USER_NS",
+        "CONFIG_UTS_NS",
+        "CONFIG_TIME_NS",
+        "CONFIG_USER_NS",
+        "CONFIG_CHECKPOINT_RESTORE",
+        "CONFIG_CHECKPOINT_RESTORE",
+        "CONFIG_SCHED_AUTOGROUP",
+        "CONFIG_BSD_PROCESS_ACCT",
+        "CONFIG_BSD_PROCESS_ACCT_V3",
+        "CONFIG_TASKSTATS",
+        "CONFIG_TASKSTATS",
+        "CONFIG_TASK_DELAY_ACCT",
+        "CONFIG_TASK_XACCT",
+        "CONFIG_TASK_IO_ACCOUNTING",
+        "CONFIG_PSI",
+        "CONFIG_PSI_DEFAULT_OFF",
+        "CONFIG_UTS_NS",
+        "CONFIG_USER_NS",
+        "CONFIG_PID_NS",
+        "CONFIG_NET_NS",
+        "CONFIG_USER_NS",
+    };
+
+    const size_t num_configs = sizeof(config_names) / sizeof(config_names[0]);
+
+    result.reserve(num_configs);
+
+    for (size_t i = 0; i < num_configs; i++) {
+        const char* key = config_names[i];
+        if (!key || key[0] == '\0') {
+            continue;
+        }
+        std::string val = get_config_val(key);
+        if (val == "n") {
+            continue;
+        }
+        KernelConfig kc;
+        kc.name = key;
+        kc.value = val;
+        // Subsystem is the part after CONFIG_ up to the first underscore.
+        // e.g. "CONFIG_EXT4_FS" -> "EXT4"
+        kc.subsystem = key;
+        size_t prefix = strlen("CONFIG_");
+        if (prefix < kc.subsystem.size()) {
+            kc.subsystem = kc.subsystem.substr(prefix);
+        }
+        // Strip trailing _FS, _DEV, etc. to get canonical subsystem name.
+        size_t us = kc.subsystem.find('_');
+        if (us != std::string::npos) {
+            kc.subsystem = kc.subsystem.substr(0, us);
+        }
+        result.push_back(std::move(kc));
+    }
+
+    // Sort by subsystem then name for consistent output
+    std::sort(result.begin(), result.end(),
+              [](const KernelConfig& a, const KernelConfig& b) {
+                  if (a.subsystem != b.subsystem) {
+                      return a.subsystem < b.subsystem;
+                  }
+                  return a.name < b.name;
+              });
+
+    return result;
+}
+
+/**
+ * Filter a collection of kernel configs by subsystem prefix.
+ * Matching is case-insensitive.
+ */
+std::vector<KernelConfig> Config::filter_by_subsystem(const std::vector<KernelConfig>& all,
+                                                       const std::string& subsystem) {
+    std::vector<KernelConfig> filtered;
+    std::string lower_sub = subsystem;
+    std::transform(lower_sub.begin(), lower_sub.end(), lower_sub.begin(), ::tolower);
+    filtered.reserve(all.size());
+
+    for (const auto& kc : all) {
+        std::string lower_name = kc.subsystem;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+        if (lower_name.find(lower_sub) != std::string::npos) {
+            filtered.push_back(kc);
+        }
+    }
+
+    return filtered;
+}
+
+/**
+ * Print all kernel config options in a formatted table.
+ */
+void Config::print_all_configs() {
+    auto all = collect_all_configs();
+
+    if (all.empty()) {
+        PRINT("No kernel configuration data found in this crash dump.\n");
+        PRINT("Ensure the kernel was built with CONFIG_IKCONFIG and the\n");
+        PRINT("ikconfig data was loaded into the crash dump.\n");
+        return;
+    }
+
+    PRINT("Kernel Configuration (IKCONFIG data)\n");
+    PRINT("====================================\n");
+    PRINT("%-40s %-8s %s\n", "CONFIG_NAME", "VALUE", "SUBSYSTEM");
+    PRINT("%-40s %-8s %s\n", "----------------------------------------", "--------",
+          "----------------------------------------");
+
+    for (const auto& kc : all) {
+        PRINT("%-40s %-8s %s\n", kc.name.c_str(), kc.value.c_str(), kc.subsystem.c_str());
+    }
+
+    PRINT("\nTotal: %zu kernel configuration options\n", all.size());
+}
+
+/**
+ * Print a single kernel config option.
+ */
+void Config::print_single_config(const std::string& key) {
+    std::string val = get_config_val(key);
+
+    if (val == "n" && !csymbol_exists(key.c_str())) {
+        // Check if symbol exists first
+        if (!get_kernel_config(TO_CONST_STRING(key.c_str()), nullptr)) {
+            // Symbol might not be in ikconfig data
+            PRINT("Configuration option '%s' not found in kernel configuration data.\n",
+                  key.c_str());
+            return;
+        }
+    }
+
+    // Try to fetch config value directly
+    char* config_val = nullptr;
+    int result = get_kernel_config(TO_CONST_STRING(key.c_str()), &config_val);
+    if (result == IKCONFIG_N) {
+        PRINT("%-40s n      (not set)\n", key.c_str());
+    } else if (result == IKCONFIG_M) {
+        PRINT("%-40s m      (module)\n", key.c_str());
+    } else if (result == IKCONFIG_Y) {
+        PRINT("%-40s y      (built-in)\n", key.c_str());
+    } else if (result == IKCONFIG_STR) {
+        PRINT("%-40s \"%s\"   (string value)\n", key.c_str(), config_val ? config_val : "");
+    } else {
+        // Fallback: try get_config_val
+        std::string fallback = get_config_val(key);
+        if (fallback != "n") {
+            PRINT("%-40s %s\n", key.c_str(), fallback.c_str());
+        } else {
+            PRINT("Configuration option '%s' not found in kernel configuration data.\n",
+                  key.c_str());
+        }
+    }
+
+    if (config_val) {
+        // Free only if allocated by crash utility (IKCONFIG_STR case)
+        // Note: get_kernel_config may or may not allocate; crash utility handles this.
+    }
+}
+
+/**
+ * Print kernel configs filtered by subsystem prefix.
+ */
+void Config::print_subsystem_filter(const std::string& subsystem) {
+    auto all = collect_all_configs();
+    auto filtered = filter_by_subsystem(all, subsystem);
+
+    if (filtered.empty()) {
+        PRINT("No kernel configuration options found for subsystem '%s'.\n", subsystem.c_str());
+        // Show available subsystems for guidance
+        if (!all.empty()) {
+            PRINT("\nAvailable subsystems:\n");
+            std::set<std::string> subsys_set;
+            for (const auto& kc : all) {
+                subsys_set.insert(kc.subsystem);
+            }
+            for (const auto& s : subsys_set) {
+                PRINT("  %s\n", s.c_str());
+            }
+        }
+        return;
+    }
+
+    PRINT("Kernel Configuration (filtered by subsystem: '%s')\n", subsystem.c_str());
+    PRINT("====================================================\n");
+    PRINT("%-40s %-8s %s\n", "CONFIG_NAME", "VALUE", "SUBSYSTEM");
+    PRINT("%-40s %-8s %s\n", "----------------------------------------", "--------",
+          "----------------------------------------");
+
+    for (const auto& kc : filtered) {
+        PRINT("%-40s %-8s %s\n", kc.name.c_str(), kc.value.c_str(), kc.subsystem.c_str());
+    }
+
+    PRINT("\nTotal: %zu kernel configuration options for subsystem '%s'\n",
+          filtered.size(), subsystem.c_str());
+}
+
+void Config::cmd_main(void) {
+    int c;
+    optind = 0;
+    bool show_all = false;
+    std::string subsystem_filter;
+    std::string single_key;
+
+    if (argcnt < 2) {
+        // Default: show all configs
+        print_all_configs();
+        return;
+    }
+
+    while ((c = getopt(argcnt, args, "as:h")) != EOF) {
+        switch (c) {
+            case 'a':
+                show_all = true;
+                break;
+            case 's':
+                subsystem_filter = optarg ? optarg : "";
+                break;
+            case 'h':
+            default:
+                cmd_usage(pc->curcmd, SYNOPSIS);
+                return;
+        }
+    }
+
+    // After options, remaining args could be a single config key
+    if (optind < argcnt) {
+        single_key = args[optind];
+    }
+
+    if (show_all) {
+        print_all_configs();
+    } else if (!subsystem_filter.empty()) {
+        print_subsystem_filter(subsystem_filter);
+    } else if (!single_key.empty()) {
+        print_single_config(single_key);
+    } else {
+        // No meaningful options given, default to all
+        print_all_configs();
+    }
+}
+
+#pragma GCC diagnostic pop
